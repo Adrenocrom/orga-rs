@@ -75,8 +75,53 @@
   .badge.prio-medium { color: var(--progress); }
   .badge.due { color: var(--muted); }
   .badge.due.overdue { color: var(--danger); border-color: var(--danger); }
-  .task .actions { display: flex; gap: 6px; }
+  .task .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .task.done .title { text-decoration: line-through; color: var(--muted); }
+  .badge.agent { color: var(--accent); border-color: var(--accent); }
+  .badge.run-queued { color: var(--muted); border-color: var(--muted); }
+  .badge.run-running { color: var(--progress); border-color: var(--progress); }
+  .badge.run-completed { color: var(--done); border-color: var(--done); }
+  .badge.run-failed, .badge.run-timed_out, .badge.run-cancelled {
+    color: var(--danger); border-color: var(--danger);
+  }
+
+  /* agent config mask */
+  details { margin-bottom: 16px; }
+  details > summary {
+    cursor: pointer; color: var(--muted); font-size: 13px;
+    padding: 8px 2px; user-select: none;
+  }
+  details > summary:hover { color: var(--text); }
+  #agent-form { margin-bottom: 12px; }
+  #agent-form .row code {
+    color: var(--muted); font-size: 12px; overflow-wrap: anywhere;
+  }
+  .agent-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 16px; margin-bottom: 8px;
+  }
+  .agent-card .head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .agent-card .head b { font-size: 15px; }
+  .agent-card .cmd {
+    font: 12px/1.5 ui-monospace, "Cascadia Code", monospace;
+    color: var(--muted); margin: 6px 0; overflow-wrap: anywhere;
+  }
+  .agent-card .actions { display: flex; gap: 6px; margin-top: 6px; }
+
+  /* runs section */
+  #runs h2 { font-size: 16px; margin: 24px 0 10px; color: var(--muted); }
+  .run {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 16px; margin-bottom: 8px;
+  }
+  .run .head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+  .run .head .spacer { flex: 1; }
+  .run pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; margin: 8px 0 0; overflow-x: auto; font-size: 12px;
+    max-height: 260px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .run .times { color: var(--muted); font-size: 12px; }
 
   #empty { color: var(--muted); text-align: center; padding: 30px; }
   #toast {
@@ -107,6 +152,7 @@
         <option value="high">high</option>
       </select>
       <input id="due" type="date">
+      <input id="workdir" placeholder="Workdir (optional, absolute path e.g. /home/me/project)" maxlength="1024">
     </div>
     <div class="form-actions">
       <button class="primary" id="submit" type="submit">Add task</button>
@@ -136,6 +182,33 @@
 
   <ul id="list"></ul>
   <p id="empty" hidden>No tasks match the current filters.</p>
+
+  <details id="agents-section">
+    <summary>Agents — configure commands that can work on tasks</summary>
+
+    <form id="agent-form" autocomplete="off">
+      <input id="agent-name" placeholder="Agent name (e.g. coder)" required maxlength="100">
+      <input id="agent-command" placeholder="Command (e.g. my-agent --model x)" required maxlength="2000">
+      <textarea id="agent-prompt" placeholder="Prompt template (optional) — placeholders: {id} {title} {description} {status} {priority} {due_date}" rows="2" maxlength="2000"></textarea>
+      <div class="row">
+        <input id="agent-timeout" type="number" min="0" max="86400" placeholder="Timeout seconds (0 = default 600)">
+      </div>
+      <div class="form-actions">
+        <button class="primary" id="agent-submit" type="submit">Add agent</button>
+        <button class="ghost" id="agent-cancel" type="button" hidden>Cancel</button>
+      </div>
+      <div class="row"><code>The command runs via <b>sh -c</b> and receives the rendered prompt on stdin — task content never touches the command line.</code></div>
+    </form>
+
+    <ul id="agent-list"></ul>
+    <p id="agents-empty" hidden>No agents configured yet.</p>
+  </details>
+
+  <section id="runs">
+    <h2>Agent runs</h2>
+    <ul id="run-list"></ul>
+    <p id="runs-empty" hidden>No agent runs yet.</p>
+  </section>
 </main>
 <div id="toast" hidden></div>
 
@@ -143,7 +216,13 @@
 'use strict';
 
 const $ = (sel) => document.querySelector(sel);
-const state = { status: '', priority: '', editing: null };
+const state = {
+  status: '', priority: '', editing: null,
+  agents: [],            // configured agents (id, name, command, ...)
+  agentEditing: null,     // agent id being edited in the config mask
+  runs: [],              // recent runs
+  pollTimer: null,        // runs polling while any run is live
+};
 
 // Escape user content before it goes into innerHTML.
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
@@ -183,14 +262,48 @@ async function load() {
     const params = new URLSearchParams();
     if (state.status) params.set('status', state.status);
     if (state.priority) params.set('priority', state.priority);
-    const [tasks, stats] = await Promise.all([
+    const [tasks, stats, agents, runs] = await Promise.all([
       api('/api/tasks?' + params.toString()),
       api('/api/stats'),
+      api('/api/agents'),
+      api('/api/runs?limit=50'),
     ]);
     renderStats(stats);
     renderList(tasks);
+    state.agents = agents;
+    renderAgents();
+    state.runs = runs;
+    renderRuns();
+    schedulePolling();
   } catch (err) {
     // Server down or erroring: show an explanation instead of an empty page.
+    toast(err.message);
+  }
+}
+
+// While any run is live (running or queued), refresh the runs (and the task
+// list, whose agent badges may change) every few seconds.
+function schedulePolling() {
+  const live = state.runs.some((r) => r.status === 'running' || r.status === 'queued');
+  if (live && !state.pollTimer) {
+    state.pollTimer = setInterval(refreshRuns, 3000);
+  } else if (!live && state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
+async function refreshRuns() {
+  try {
+    state.runs = await api('/api/runs?limit=50');
+    renderRuns();
+    schedulePolling();
+    // A finished run may have changed the task's agent assignment.
+    const params = new URLSearchParams();
+    if (state.status) params.set('status', state.status);
+    if (state.priority) params.set('priority', state.priority);
+    renderList(await api('/api/tasks?' + params.toString()));
+  } catch (err) {
     toast(err.message);
   }
 }
@@ -220,6 +333,11 @@ function renderList(tasks) {
     const li = document.createElement('li');
     li.className = 'task' + (task.status === 'done' ? ' done' : '');
     const overdue = task.due_date && task.status !== 'done' && task.due_date < today;
+    const agentOptions = ['<option value="">— no agent —</option>']
+      .concat(state.agents.map((a) =>
+        `<option value="${a.id}"${task.agent_id === a.id ? ' selected' : ''}>${esc(a.name)}</option>`
+      ))
+      .join('');
     li.innerHTML = `
       <div class="body">
         <p class="title">${esc(task.title)}</p>
@@ -230,6 +348,11 @@ function renderList(tasks) {
           </button>
           <span class="badge prio-${esc(task.priority)}">${esc(task.priority)}</span>
           ${task.due_date ? `<span class="badge due${overdue ? ' overdue' : ''}">due ${esc(task.due_date)}</span>` : ''}
+          ${task.workdir ? `<span class="badge" title="Working directory for agent runs">📁 ${esc(task.workdir)}</span>` : ''}
+          <select class="agent-select" data-action="assign" title="Assign an agent">
+            ${agentOptions}
+          </select>
+          <button class="primary" data-action="run" ${task.agent_id ? '' : 'disabled title="Assign an agent first"'}>▶ Run</button>
         </div>
       </div>
       <div class="actions">
@@ -239,8 +362,34 @@ function renderList(tasks) {
     li.querySelector('[data-action="cycle"]').addEventListener('click', () => cycleStatus(task));
     li.querySelector('[data-action="edit"]').addEventListener('click', () => startEdit(task));
     li.querySelector('[data-action="delete"]').addEventListener('click', () => removeTask(task));
+    li.querySelector('[data-action="assign"]').addEventListener('change', (e) => assignAgent(task, e.target.value));
+    li.querySelector('[data-action="run"]').addEventListener('click', () => runTask(task));
     list.appendChild(li);
   }
+}
+
+async function assignAgent(task, agentId) {
+  try {
+    if (agentId) {
+      await api(`/api/tasks/${task.id}/agent`, {
+        method: 'PUT',
+        body: JSON.stringify({ agent_id: Number(agentId) }),
+      });
+    } else {
+      await api(`/api/tasks/${task.id}/agent`, { method: 'DELETE' });
+    }
+    await load();
+  } catch (err) { toast(err.message); }
+}
+
+async function runTask(task) {
+  try {
+    const run = await api(`/api/tasks/${task.id}/run`, { method: 'POST', body: '{}' });
+    toast(run.status === 'queued'
+      ? `Agent is busy — run #${run.id} queued (starts when the current run ends)`
+      : `Agent started (run #${run.id})`);
+    await load();
+  } catch (err) { toast(err.message); }
 }
 
 async function cycleStatus(task) {
@@ -258,6 +407,7 @@ function startEdit(task) {
   $('#status').value = task.status;
   $('#priority').value = task.priority;
   $('#due').value = task.due_date || '';
+  $('#workdir').value = task.workdir || '';
   $('#submit').textContent = 'Save changes';
   $('#cancel').hidden = false;
   $('#title').focus();
@@ -279,17 +429,132 @@ async function removeTask(task) {
   } catch (err) { toast(err.message); }
 }
 
+// ---------- agent config mask ----------
+
+function renderAgents() {
+  const list = $('#agent-list');
+  list.innerHTML = '';
+  $('#agents-empty').hidden = state.agents.length > 0;
+
+  for (const agent of state.agents) {
+    const li = document.createElement('li');
+    li.className = 'agent-card';
+    li.innerHTML = `
+      <div class="head">
+        <b>${esc(agent.name)}</b>
+        <span class="badge">#${agent.id}</span>
+        ${agent.timeout_secs ? `<span class="badge">timeout ${agent.timeout_secs}s</span>` : ''}
+      </div>
+      <div class="cmd">${esc(agent.command)}</div>
+      ${agent.prompt_template ? `<div class="cmd">prompt: ${esc(agent.prompt_template)}</div>` : ''}
+      <div class="actions">
+        <button class="ghost" data-action="edit-agent">Edit</button>
+        <button class="danger" data-action="delete-agent">Delete</button>
+      </div>`;
+    li.querySelector('[data-action="edit-agent"]').addEventListener('click', () => startAgentEdit(agent));
+    li.querySelector('[data-action="delete-agent"]').addEventListener('click', () => removeAgent(agent));
+    list.appendChild(li);
+  }
+}
+
+function startAgentEdit(agent) {
+  state.agentEditing = agent.id;
+  $('#agent-name').value = agent.name;
+  $('#agent-command').value = agent.command;
+  $('#agent-prompt').value = agent.prompt_template || '';
+  $('#agent-timeout').value = agent.timeout_secs || '';
+  $('#agent-submit').textContent = 'Save agent';
+  $('#agent-cancel').hidden = false;
+  $('#agents-section').open = true;
+  $('#agent-name').focus();
+}
+
+function stopAgentEditing() {
+  state.agentEditing = null;
+  $('#agent-form').reset();
+  $('#agent-submit').textContent = 'Add agent';
+  $('#agent-cancel').hidden = true;
+}
+
+async function removeAgent(agent) {
+  if (!confirm(`Delete agent "${agent.name}"? Tasks assigned to it lose the assignment; run history is kept.`)) return;
+  try {
+    await api(`/api/agents/${agent.id}`, { method: 'DELETE' });
+    if (state.agentEditing === agent.id) stopAgentEditing();
+    await load();
+  } catch (err) { toast(err.message); }
+}
+
+$('#agent-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const payload = {
+    name: $('#agent-name').value,
+    command: $('#agent-command').value,
+    prompt_template: $('#agent-prompt').value || null,
+    timeout_secs: Number($('#agent-timeout').value) || 0,
+  };
+  try {
+    if (state.agentEditing) {
+      await api(`/api/agents/${state.agentEditing}`, { method: 'PUT', body: JSON.stringify(payload) });
+    } else {
+      await api('/api/agents', { method: 'POST', body: JSON.stringify(payload) });
+    }
+    stopAgentEditing();
+    await load();
+  } catch (err) { toast(err.message); }
+});
+
+$('#agent-cancel').addEventListener('click', stopAgentEditing);
+
+// ---------- runs ----------
+
+function renderRuns() {
+  const list = $('#run-list');
+  list.innerHTML = '';
+  $('#runs-empty').hidden = state.runs.length > 0;
+
+  for (const run of state.runs) {
+    const li = document.createElement('li');
+    li.className = 'run';
+    const started = new Date(run.started_at).toLocaleString();
+    const ended = run.ended_at ? new Date(run.ended_at).toLocaleString() : '';
+    li.innerHTML = `
+      <div class="head">
+        <span class="badge run-${esc(run.status)}">${esc(run.status)}</span>
+        <b>${esc(run.agent_name)}</b>
+        <span class="times">on task #${run.task_id} · started ${esc(started)}${ended ? ` · ended ${esc(ended)}` : ''}</span>
+        <span class="spacer"></span>
+        ${run.exit_code !== null && run.exit_code !== undefined ? `<span class="badge">exit ${run.exit_code}</span>` : ''}
+        ${run.status === 'running' || run.status === 'queued' ? `<button class="danger" data-action="cancel-run">Cancel</button>` : ''}
+      </div>
+      ${run.output ? `<pre>${esc(run.output)}</pre>` : ''}`;
+    const cancelBtn = li.querySelector('[data-action="cancel-run"]');
+    if (cancelBtn) cancelBtn.addEventListener('click', () => cancelRun(run));
+    list.appendChild(li);
+  }
+}
+
+async function cancelRun(run) {
+  try {
+    await api(`/api/runs/${run.id}`, { method: 'DELETE' });
+    await refreshRuns();
+  } catch (err) { toast(err.message); }
+}
+
 $('#form').addEventListener('submit', async (e) => {
   e.preventDefault();
   // When editing, an emptied date field must clear the due date: the API
   // treats "" as "clear" and a missing/null field as "keep current value".
+  // The same applies to the workdir.
   const due = $('#due').value || (state.editing ? '' : null);
+  const workdir = $('#workdir').value.trim() || (state.editing ? '' : null);
   const payload = {
     title: $('#title').value,
     description: $('#description').value,
     status: $('#status').value,
     priority: $('#priority').value,
     due_date: due,
+    workdir,
   };
   try {
     if (state.editing) {

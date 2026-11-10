@@ -1,6 +1,7 @@
 mod db;
 mod mcp;
 mod models;
+mod runner;
 mod web;
 
 use std::net::SocketAddr;
@@ -62,6 +63,10 @@ async fn serve(addr_arg: Option<&str>) {
         .map(|s| s.parse().expect("invalid listen address"))
         .unwrap_or_else(|| "127.0.0.1:3000".parse().unwrap());
     let db: SharedDb = Arc::new(Mutex::new(Db::open(&db_path()).expect("cannot open database")));
+    // Runs marked `running` belong to processes of a previous server
+    // process; they cannot still be alive. Flip them to `failed` before
+    // accepting requests so the history is honest.
+    runner::fail_orphaned_runs(&db.lock().expect("db mutex poisoned"));
     if let Err(e) = web::serve(db, addr, api_token()).await {
         eprintln!("web server error: {e}");
         std::process::exit(1);

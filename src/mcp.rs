@@ -20,7 +20,9 @@ use std::io::{self, BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::models::{check_due_date, check_enum, check_title, PRIORITIES, STATUSES};
+use crate::models::{
+    check_due_date, check_enum, check_title, check_workdir, PRIORITIES, RUN_STATUSES, STATUSES,
+};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "orga-rs";
@@ -103,7 +105,10 @@ fn initialize_result() -> Value {
         "instructions": "Tools manage a task list. Statuses are todo/in_progress/done, \
 priorities low/medium/high. due_date must be a real calendar date formatted YYYY-MM-DD. \
 On update_task, omit fields you do not want to change and pass due_date as an empty \
-string to clear it. Use task_stats for a quick summary."
+string to clear it. Use task_stats for a quick summary. Configured agents (list_agents) \
+can be spawned on a task with run_task; they work in the background — poll get_run \
+for the outcome. Each agent runs one task at a time; further runs are queued and start \
+automatically. A task's optional workdir is the directory the agent executes in."
     })
 }
 
@@ -134,6 +139,10 @@ fn call_tool(api: &Api, params: &Value) -> Result<Value, Value> {
         "update_task" => tool_update_task(api, &args),
         "delete_task" => tool_delete_task(api, &args),
         "task_stats" => tool_task_stats(api),
+        "list_agents" => tool_list_agents(api),
+        "run_task" => tool_run_task(api, &args),
+        "get_run" => tool_get_run(api, &args),
+        "list_runs" => tool_list_runs(api, &args),
         other => {
             return Err(json!({
                 "code": -32602,
@@ -237,6 +246,111 @@ fn tool_task_stats(api: &Api) -> ToolResult {
     Ok(ToolOutput { text, structured: Some(stats) })
 }
 
+// ---------- agent tools ----------
+
+fn tool_list_agents(api: &Api) -> ToolResult {
+    let agents = api.get_json("/api/agents", "list agents")?;
+    let Some(arr) = agents.as_array() else {
+        return Err("server returned an unexpected response".to_string());
+    };
+    if arr.is_empty() {
+        return Ok(ToolOutput::text(
+            "No agents configured. Agents are configured via the dashboard or \
+the REST API (POST /api/agents)."
+                .to_string(),
+        ));
+    }
+    let mut lines = vec![format!("{} agent{}:", arr.len(), if arr.len() == 1 { "" } else { "s" })];
+    for agent in arr {
+        let field = |key: &str| agent.get(key).and_then(Value::as_str).unwrap_or("");
+        let id = agent.get("id").and_then(Value::as_i64).unwrap_or_default();
+        lines.push(format!(
+            "#{} {} — `{}`",
+            id,
+            field("name"),
+            field("command")
+        ));
+    }
+    Ok(ToolOutput::text(lines.join("\n")))
+}
+
+/// Run an agent on a task. The agent is spawned by the server and works in
+/// the background; the tool returns the run record immediately.
+fn tool_run_task(api: &Api, args: &Value) -> ToolResult {
+    let id = req_id(args)?;
+    // The task id travels in the URL path; only an optional agent_id goes
+    // in the body (without it, the server uses the task's assigned agent).
+    let mut body = json!({});
+    if let Some(agent_id) = args.get("agent_id") {
+        body["agent_id"] = agent_id.clone();
+    }
+    let run = api.post_json(&format!("/api/tasks/{id}/run"), &body, "run agent")?;
+    let status = run.get("status").and_then(Value::as_str).unwrap_or("");
+    let hint = if status == "queued" {
+        "The agent is busy with another run; this run is queued and will start \
+automatically. Poll get_run for the outcome."
+    } else {
+        "Agent started. Poll get_run for the outcome."
+    };
+    let text = serde_json::to_string_pretty(&run)
+        .map_err(|e| format!("serialization error: {e}"))?;
+    Ok(ToolOutput::text(format!(
+        "{hint}\n{text}",
+    )))
+}
+
+fn tool_get_run(api: &Api, args: &Value) -> ToolResult {
+    let id = req_id(args)?;
+    let run = api.get_json(&format!("/api/runs/{id}"), "fetch run")?;
+    to_text(&run).map(ToolOutput::text)
+}
+
+fn tool_list_runs(api: &Api, args: &Value) -> ToolResult {
+    let task_id = opt_i64(args, "task_id")?;
+    let status = opt_string(args, "status")?;
+    if let Some(s) = status.as_deref() {
+        check_enum("status", Some(s), &RUN_STATUSES)?;
+    }
+    let mut path = String::from("/api/runs?");
+    if let Some(t) = task_id {
+        path.push_str(&format!("task_id={t}&"));
+    }
+    if let Some(s) = &status {
+        path.push_str(&format!("status={}&", urlencode(s)));
+    }
+    path.push_str("limit=50");
+    let runs = api.get_json(&path, "list runs")?;
+    let Some(arr) = runs.as_array() else {
+        return Err("server returned an unexpected response".to_string());
+    };
+    if arr.is_empty() {
+        return Ok(ToolOutput::text("No runs found.".to_string()));
+    }
+    let mut lines = vec![format!("{} run{}:", arr.len(), if arr.len() == 1 { "" } else { "s" })];
+    for run in arr {
+        lines.push(run_line(run));
+    }
+    Ok(ToolOutput::text(lines.join("\n")))
+}
+
+/// One-line run summary, e.g. `#12 task #3 by coder: completed (exit 0)`.
+fn run_line(run: &Value) -> String {
+    let field = |key: &str| run.get(key).and_then(Value::as_str).unwrap_or("");
+    let id = run.get("id").and_then(Value::as_i64).unwrap_or_default();
+    let task_id = run.get("task_id").and_then(Value::as_i64).unwrap_or_default();
+    let exit = run
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .map(|c| format!("exit {c}"))
+        .unwrap_or_default();
+    format!(
+        "#{id} task #{task_id} by {}: {}{}",
+        field("agent_name"),
+        field("status"),
+        if exit.is_empty() { String::new() } else { format!(" ({exit})") }
+    )
+}
+
 /// Validate the task fields of a create/update call before sending them to
 /// the server, so the model gets a precise error instead of a generic 400.
 /// `id` is stripped from the body (it travels in the URL path).
@@ -256,6 +370,7 @@ fn validate_task_body(args: &Value, is_update: bool) -> Result<Value, String> {
     check_enum("status", opt_string(args, "status")?.as_deref(), &STATUSES)?;
     check_enum("priority", opt_string(args, "priority")?.as_deref(), &PRIORITIES)?;
     check_due_date(opt_string(args, "due_date")?.as_deref())?;
+    check_workdir(opt_string(args, "workdir")?.as_deref())?;
     Ok(body)
 }
 
@@ -404,6 +519,11 @@ fn tool_definitions() -> Value {
         // due date on update, and a strict client would otherwise reject it.
         "pattern": "^(\\d{4}-\\d{2}-\\d{2})?$"
     });
+    let workdir_schema = json!({
+        "type": "string",
+        "description": "Absolute path the agent process executes in, or an empty string for none.",
+        "pattern": "^(/.*)?$"
+    });
     json!([
         {
             "name": "list_tasks",
@@ -441,7 +561,8 @@ default to status=todo, priority=medium, no due date.",
                     "description": { "type": "string", "description": "Optional details." },
                     "status": { "type": "string", "enum": status_enum },
                     "priority": { "type": "string", "enum": priority_enum },
-                    "due_date": due_date_schema
+                    "due_date": due_date_schema,
+                    "workdir": workdir_schema
                 },
                 "required": ["title"]
             }
@@ -462,6 +583,11 @@ given; omitted fields keep their current value. Pass due_date as an empty string
                         "type": "string",
                         "description": "YYYY-MM-DD, or \"\" to clear.",
                         "pattern": "^(\\d{4}-\\d{2}-\\d{2})?$"
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Absolute path, or \"\" to clear.",
+                        "pattern": "^(/.*)?$"
                     }
                 },
                 "required": ["id"]
@@ -491,6 +617,52 @@ given; omitted fields keep their current value. Pass due_date as an empty string
                 },
                 "required": ["total", "todo", "in_progress", "done", "overdue"]
             }
+        },
+        {
+            "name": "list_agents",
+            "description": "List the configured agents (name + command). Agents are \
+configured by the user via the dashboard or the REST API; they cannot be created \
+through this tool.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "run_task",
+            "description": "Spawn a configured agent to work on a task. The agent \
+process is started by the server and runs in the background; this returns \
+immediately with a run record. Each agent runs one task at a time — when the \
+agent is busy, the run is queued (status \"queued\") and starts automatically \
+when the current run ends. Poll get_run (or list_runs) for the outcome. \
+Without agent_id, the task's assigned agent is used. The agent process \
+executes in the task's workdir when one is set.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": id_schema,
+                    "agent_id": { "type": "integer", "description": "Agent id; defaults to the task's assigned agent." }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "get_run",
+            "description": "Fetch one agent run by id, including its captured output.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": id_schema },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "list_runs",
+            "description": "List agent runs, newest first, optionally filtered by \
+task_id and status (queued/running/completed/failed/timed_out/cancelled).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "integer" },
+                    "status": { "type": "string", "enum": json!(RUN_STATUSES) }
+                }
+            }
         }
     ])
 }
@@ -516,6 +688,17 @@ fn opt_string(args: &Value, key: &str) -> Result<Option<String>, String> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(format!("{key} must be a string")),
+    }
+}
+
+fn opt_i64(args: &Value, key: &str) -> Result<Option<i64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be an integer")),
+        Some(_) => Err(format!("{key} must be an integer")),
     }
 }
 
@@ -596,7 +779,12 @@ mod tests {
         let db: crate::db::SharedDb = std::sync::Arc::new(std::sync::Mutex::new(
             crate::db::Db::open(":memory:").unwrap(),
         ));
-        let app = crate::web::router(db, None);
+        let state = crate::web::AppState {
+            db,
+            registry: std::sync::Arc::new(crate::runner::RunRegistry::default()),
+            slots: std::sync::Arc::new(crate::runner::AgentSlots::default()),
+        };
+        let app = crate::web::router(state, None);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap(); // required by tokio's from_std
         let addr = listener.local_addr().unwrap();
@@ -646,7 +834,7 @@ mod tests {
         assert!(responses[0]["result"]["instructions"].as_str().unwrap().contains("YYYY-MM-DD"));
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 10);
         let stats_tool = tools.iter().find(|t| t["name"] == "task_stats").unwrap();
         assert!(stats_tool["outputSchema"].is_object());
 
@@ -725,6 +913,61 @@ mod tests {
         let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("cannot reach the task server"));
         assert!(text.contains("orga-rs serve"));
+    }
+
+    #[test]
+    fn stdio_agent_tools_end_to_end() {
+        let (api, _port) = spawn_server();
+        // Configure an agent directly through the REST API (agents are
+        // user-configured, not model-created), then drive it over MCP.
+        let agent = api
+            .post_json(
+                "/api/agents",
+                &json!({
+                    "name": "echoer",
+                    "command": "cat",
+                    "prompt_template": "work on: {title}"
+                }),
+                "create agent",
+            )
+            .unwrap();
+        let agent_id = agent["id"].as_i64().unwrap();
+
+        let run_line = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "run_task", "arguments": { "id": 1, "agent_id": agent_id } }
+        })
+        .to_string();
+        let input = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_agents","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_task","arguments":{"title":"MCP agent task"}}}"#,
+            &run_line,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_runs","arguments":{}}}"#,
+        ]
+        .join("\n");
+        let responses = session(&api, &input);
+
+        // list_agents shows the configured agent
+        let listed = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(listed.contains("echoer"));
+        assert!(listed.contains("cat"));
+
+        // run_task spawns and returns the run record (usually still
+        // "running"; a fast agent may already have finished)
+        let run_text = responses[2]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(run_text.contains("Poll get_run"));
+        assert!(run_text.contains("running") || run_text.contains("completed"));
+        // list_runs shows the run; give the supervisor a moment to finish
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let responses = session(
+            &api,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_runs","arguments":{}}}"#,
+        );
+        let runs = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(runs.contains("echoer"));
+        assert!(runs.contains("completed") || runs.contains("running"));
     }
 
     #[test]

@@ -2,12 +2,16 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, Row, TransactionBehavior};
 
-use crate::models::{CreateTask, Priority, Stats, Status, Task, UpdateTask};
+use crate::models::{
+    Agent, CreateAgent, CreateTask, Priority, Run, RunStatus, Stats, Status, Task, UpdateAgent,
+    UpdateTask,
+};
 
 /// Shared handle passed into the web server's router.
 pub type SharedDb = Arc<Mutex<Db>>;
 
-const COLUMNS: &str = "id, title, description, status, priority, due_date, created_at, updated_at";
+const COLUMNS: &str =
+    "id, title, description, status, priority, due_date, agent_id, workdir, created_at, updated_at";
 
 pub struct Db {
     conn: Connection,
@@ -30,11 +34,51 @@ impl Db {
                 status      TEXT NOT NULL DEFAULT 'todo',
                 priority    TEXT NOT NULL DEFAULT 'medium',
                 due_date    TEXT,
+                agent_id    INTEGER REFERENCES agents(id),
+                workdir     TEXT,
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);",
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+            CREATE TABLE IF NOT EXISTS agents (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL,
+                command         TEXT NOT NULL,
+                prompt_template TEXT,
+                timeout_secs    INTEGER,
+                created_at      TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runs (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                agent_id   INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+                agent_name TEXT NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'running',
+                exit_code  INTEGER,
+                output     TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL,
+                ended_at   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id);
+            CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);",
         )?;
+        // Migration for databases created before agents/workdirs existed:
+        // add the missing columns if (and only if) they are missing. Checked
+        // via pragma so opening an existing file twice stays idempotent.
+        let has_agent_id: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'agent_id'")?
+            .exists([])?;
+        if !has_agent_id {
+            conn.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN agent_id INTEGER REFERENCES agents(id)",
+            )?;
+        }
+        let has_workdir: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'workdir'")?
+            .exists([])?;
+        if !has_workdir {
+            conn.execute_batch("ALTER TABLE tasks ADD COLUMN workdir TEXT")?;
+        }
         Ok(Self { conn })
     }
 
@@ -46,8 +90,10 @@ impl Db {
             status: row.get(3)?,
             priority: row.get(4)?,
             due_date: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+            agent_id: row.get(6)?,
+            workdir: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     }
 
@@ -97,9 +143,17 @@ impl Db {
         let due_date = normalize_due(&input.due_date);
 
         self.conn.execute(
-            "INSERT INTO tasks (title, description, status, priority, due_date, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![title, description, status, priority, due_date, now],
+            "INSERT INTO tasks (title, description, status, priority, due_date, workdir, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                title,
+                description,
+                status,
+                priority,
+                due_date,
+                normalize_workdir(input.workdir.as_deref()),
+                now
+            ],
         )?;
         let id = self.conn.last_insert_rowid();
         // The row was just inserted through this connection and cannot have
@@ -151,19 +205,27 @@ impl Db {
                 Some("") => None,           // empty string -> clear
                 Some(s) => Some(s.to_string()),
             },
+            workdir: match input.workdir.as_deref().map(str::trim) {
+                None => existing.workdir, // not provided -> keep
+                Some("") => None,          // empty string -> clear
+                Some(s) => Some(s.to_string()),
+            },
+            agent_id: existing.agent_id, // assignment is managed by /run and /agent
             created_at: existing.created_at,
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
         let changed = tx.execute(
             "UPDATE tasks
-             SET title = ?1, description = ?2, status = ?3, priority = ?4, due_date = ?5, updated_at = ?6
-             WHERE id = ?7",
+             SET title = ?1, description = ?2, status = ?3, priority = ?4, due_date = ?5,
+                 workdir = ?6, updated_at = ?7
+             WHERE id = ?8",
             params![
                 merged.title,
                 merged.description,
                 merged.status,
                 merged.priority,
                 merged.due_date,
+                merged.workdir,
                 merged.updated_at,
                 id
             ],
@@ -205,6 +267,335 @@ impl Db {
             },
         )
     }
+
+    // ---------- agents ----------
+
+    fn row_to_agent(row: &Row) -> rusqlite::Result<Agent> {
+        Ok(Agent {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            command: row.get(2)?,
+            prompt_template: row.get(3)?,
+            timeout_secs: row.get(4)?,
+        })
+    }
+
+    pub fn list_agents(&self) -> rusqlite::Result<Vec<Agent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, command, prompt_template, timeout_secs
+             FROM agents ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_agent)?;
+        rows.collect()
+    }
+
+    pub fn get_agent(&self, id: i64) -> rusqlite::Result<Option<Agent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, command, prompt_template, timeout_secs
+             FROM agents WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], Self::row_to_agent)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn create_agent(&self, input: &CreateAgent) -> rusqlite::Result<Agent> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO agents (name, command, prompt_template, timeout_secs, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                input.name.trim(),
+                input.command.trim(),
+                normalize_template(input.prompt_template.as_deref()),
+                input.timeout_secs,
+                now
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_agent(id)?.ok_or_else(|| {
+            rusqlite::Error::QueryReturnedNoRows
+        })
+    }
+
+    /// Merge `input` into the existing agent. Returns `None` if the id is
+    /// unknown. An empty `prompt_template` clears it (back to the default
+    /// prompt); an empty `timeout_secs` (0) resets it to the default.
+    pub fn update_agent(
+        &mut self,
+        id: i64,
+        input: &UpdateAgent,
+    ) -> Result<Option<Agent>, UpdateError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(existing) = Self::get_agent_on(&tx, id)? else {
+            return Ok(None);
+        };
+        let merged = Agent {
+            id,
+            name: match input.name.as_deref() {
+                Some(n) => n.trim().to_string(),
+                None => existing.name,
+            },
+            command: match input.command.as_deref() {
+                Some(c) => c.trim().to_string(),
+                None => existing.command,
+            },
+            prompt_template: match input.prompt_template.as_deref() {
+                None => existing.prompt_template, // not provided -> keep
+                Some(t) => normalize_template(Some(t)), // "" -> None (default prompt)
+            },            timeout_secs: match input.timeout_secs {
+                None => existing.timeout_secs, // not provided -> keep
+                Some(0) => None,               // 0 -> default timeout
+                Some(t) => Some(t),
+            },
+        };
+        tx.execute(
+            "UPDATE agents
+             SET name = ?1, command = ?2, prompt_template = ?3, timeout_secs = ?4
+             WHERE id = ?5",
+            params![
+                merged.name,
+                merged.command,
+                merged.prompt_template,
+                merged.timeout_secs,
+                id
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some(merged))
+    }
+
+    fn get_agent_on(conn: &Connection, id: i64) -> rusqlite::Result<Option<Agent>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, command, prompt_template, timeout_secs
+             FROM agents WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], Self::row_to_agent)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete an agent. Returns `false` if the id did not exist. The
+    /// assignment on tasks is cleared (ON DELETE SET NULL via the FK);
+    /// historical runs keep their `agent_name` snapshot. Queued runs are
+    /// marked failed first — after the deletion their `agent_id` is NULL,
+    /// so nothing would ever pick them up.
+    pub fn delete_agent(&self, id: i64) -> rusqlite::Result<bool> {
+        // Fail queued runs before the FK nulls their agent_id.
+        self.conn.execute(
+            "UPDATE runs
+             SET status = 'failed', ended_at = ?1,
+                 output = 'agent deleted while this run was queued'
+             WHERE agent_id = ?2 AND status = 'queued'",
+            params![chrono::Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(self.conn.execute("DELETE FROM agents WHERE id = ?1", params![id])? > 0)
+    }
+
+    /// Assign an agent to a task. Returns `false` if the task or the agent
+    /// does not exist.
+    pub fn assign_agent(&self, task_id: i64, agent_id: i64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET agent_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![agent_id, chrono::Utc::now().to_rfc3339(), task_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Remove the agent assignment from a task. Returns `false` if the task
+    /// does not exist (removing from an unassigned task is a no-op success).
+    pub fn unassign_agent(&self, task_id: i64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET agent_id = NULL, updated_at = ?1 WHERE id = ?2",
+            params![chrono::Utc::now().to_rfc3339(), task_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Set or clear the working directory of a task. Returns `false` if the
+    /// task does not exist. An empty string clears it.
+    pub fn set_workdir(&self, task_id: i64, workdir: Option<&str>) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET workdir = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                normalize_workdir(workdir),
+                chrono::Utc::now().to_rfc3339(),
+                task_id
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    // ---------- runs ----------
+
+    fn row_to_run(row: &Row) -> rusqlite::Result<Run> {
+        Ok(Run {
+            id: row.get(0)?,
+            task_id: row.get(1)?,
+            agent_id: row.get(2)?,
+            agent_name: row.get(3)?,
+            status: row.get(4)?,
+            exit_code: row.get(5)?,
+            output: row.get(6)?,
+            started_at: row.get(7)?,
+            ended_at: row.get(8)?,
+        })
+    }
+
+    /// List runs, newest first, optionally filtered by task and status.
+    pub fn list_runs(
+        &self,
+        task_id: Option<i64>,
+        status: Option<&str>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Run>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.task_id, r.agent_id, r.agent_name, r.status,
+                    r.exit_code, r.output, r.started_at, r.ended_at
+             FROM runs r
+             WHERE (?1 IS NULL OR r.task_id = ?1)
+               AND (?2 IS NULL OR r.status = ?2)
+             ORDER BY r.id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![task_id, status, limit], Self::row_to_run)?;
+        rows.collect()
+    }
+
+    pub fn get_run(&self, id: i64) -> rusqlite::Result<Option<Run>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.task_id, r.agent_id, r.agent_name, r.status,
+                    r.exit_code, r.output, r.started_at, r.ended_at
+             FROM runs r WHERE r.id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], Self::row_to_run)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert a run and return it. The agent name is snapshotted so history
+    /// stays readable after the agent is deleted. `status` is `queued` when
+    /// the agent's single execution slot is taken (the run starts when the
+    /// slot frees) or `running` when the process is spawned immediately.
+    pub fn create_run(
+        &self,
+        task_id: i64,
+        agent: &Agent,
+        status: RunStatus,
+    ) -> rusqlite::Result<Run> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO runs (task_id, agent_id, agent_name, status, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![task_id, agent.id, agent.name, status.as_str(), now],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_run(id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    /// Flip a `queued` run to `running` (the agent's slot freed and the
+    /// process is about to be spawned). Returns `false` if the run is no
+    /// longer queued (e.g. it was cancelled while waiting).
+    pub fn start_run(&self, id: i64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET status = 'running' WHERE id = ?1 AND status = 'queued'",
+            params![id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The oldest `queued` run for an agent, if any — the next one to start
+    /// when the agent's execution slot frees.
+    pub fn next_queued_run(&self, agent_id: i64) -> rusqlite::Result<Option<Run>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.task_id, r.agent_id, r.agent_name, r.status,
+                    r.exit_code, r.output, r.started_at, r.ended_at
+             FROM runs r
+             WHERE r.agent_id = ?1 AND r.status = 'queued'
+             ORDER BY r.id ASC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![agent_id], Self::row_to_run)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record the outcome of a run. Returns `false` if the run row vanished
+    /// (e.g. the task was deleted mid-run and the cascade removed the run).
+    pub fn finish_run(
+        &self,
+        id: i64,
+        status: RunStatus,
+        exit_code: Option<i64>,
+        output: &str,
+    ) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE runs
+             SET status = ?1, exit_code = ?2, output = ?3, ended_at = ?4
+             WHERE id = ?5",
+            params![
+                status.as_str(),
+                exit_code,
+                output,
+                chrono::Utc::now().to_rfc3339(),
+                id
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// All runs still `queued` or `running` — used at startup to mark runs
+    /// orphaned by a restart as failed.
+    pub fn unfinished_runs(&self) -> rusqlite::Result<Vec<Run>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.task_id, r.agent_id, r.agent_name, r.status,
+                    r.exit_code, r.output, r.started_at, r.ended_at
+             FROM runs r WHERE r.status IN ('queued', 'running')",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_run)?;
+        rows.collect()
+    }
+
+    /// Put a run back into the queue (used when a picked-up queued run
+    /// cannot be started). Returns `false` if the run is not `running`.
+    pub fn requeue_run(&self, id: i64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET status = 'queued' WHERE id = ?1 AND status = 'running'",
+            params![id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Mark a run as cancelled. Works for `queued` runs (nothing to kill,
+    /// just drop out of the queue) and `running` runs (the caller kills the
+    /// process via the registry). Returns `false` if the run does not exist
+    /// or is already finished.
+    pub fn cancel_run(&self, id: i64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET status = 'cancelled', ended_at = ?1
+             WHERE id = ?2 AND status IN ('queued', 'running')",
+            params![chrono::Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(changed == 1)
+    }
+}
+
+/// Treat a missing or whitespace-only prompt template as "use the default".
+fn normalize_template(template: Option<&str>) -> Option<String> {
+    template
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 /// Failure modes of [`Db::update`], kept distinct so a blank title (a client
@@ -247,6 +638,14 @@ fn normalize_due(due: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Treat a missing or whitespace-only workdir as "no workdir".
+fn normalize_workdir(workdir: Option<&str>) -> Option<String> {
+    workdir
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +661,7 @@ mod tests {
             status: None,
             priority: None,
             due_date: None,
+            workdir: None,
         }
     }
 
@@ -297,6 +697,7 @@ mod tests {
             status: Some("done".into()),
             priority: None,
             due_date: Some("".into()), // empty string clears the due date
+            workdir: None,
         };
         let updated = db.update(task.id, &patch).unwrap().unwrap();
         assert_eq!(updated.title, "Ship it");
@@ -342,6 +743,33 @@ mod tests {
         let only = db.list(None, Some("low")).unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].title, "low task");
+    }
+
+    #[test]
+    fn deleting_an_agent_fails_its_queued_runs() {
+        let db = db();
+        let task = db.create(&create("queued work")).unwrap();
+        let agent = db
+            .create_agent(&CreateAgent {
+                name: "doomed".into(),
+                command: "true".into(),
+                prompt_template: None,
+                timeout_secs: None,
+            })
+            .unwrap();
+
+        // A queued run (as if the agent's slot were taken).
+        let run = db
+            .create_run(task.id, &agent, crate::models::RunStatus::Queued)
+            .unwrap();
+        assert_eq!(run.status, "queued");
+
+        // Deleting the agent must not leave the run waiting forever.
+        assert!(db.delete_agent(agent.id).unwrap());
+        let run = db.get_run(run.id).unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run.output.contains("agent deleted"));
+        assert!(run.ended_at.is_some());
     }
 
     #[test]

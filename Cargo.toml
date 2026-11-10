@@ -10,8 +10,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Only what is used: multi-thread runtime + #[tokio::main], TCP listener,
-# and the ctrl-c/SIGTERM handlers for graceful shutdown.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# ctrl-c/SIGTERM handlers for graceful shutdown, child-process supervision
+# for agent runs (process + io-util), run timeouts (time) and the
+# cancellation channel (sync).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "time", "sync"] }
 ureq = { version = "2.12", features = ["json"] }
 
 [dev-dependencies]
