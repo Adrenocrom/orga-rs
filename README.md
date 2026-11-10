@@ -71,7 +71,7 @@ JavaScript framework) that talks to the REST API:
   description field is generously sized by default
 - optional **workdir** per task — the directory its agent runs execute in
 - **Agents section**: configure agents (name, command, optional prompt
-  template, optional timeout), edit and delete them
+  template, optional timeout) in an add/edit dialog, edit and delete them
 - per task: pick an agent from the dropdown and press **▶ Run agent** — the
   agent process is spawned by the server and works in the background; if
   the agent is already busy, the run is queued and starts automatically

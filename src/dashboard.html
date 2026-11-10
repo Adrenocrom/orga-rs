@@ -148,14 +148,14 @@
   form .row > * { flex: 1; min-width: 130px; }
   .form-actions { display: flex; gap: 10px; }
 
-  /* agent config mask */
+  /* agents section (collapsible) */
   details { margin: 24px 0 16px; }
   details > summary {
     cursor: pointer; color: var(--muted); font-size: 13px;
     padding: 8px 2px; user-select: none;
   }
   details > summary:hover { color: var(--text); }
-  #agent-form { margin-bottom: 12px; }
+  #agents-section .section-actions { margin: 10px 0 12px; }
   #agent-form .row code {
     color: var(--muted); font-size: 12px; overflow-wrap: anywhere;
   }
@@ -270,7 +270,17 @@
 
   <details id="agents-section">
     <summary>Agents — configure commands that can work on tasks</summary>
+    <div class="section-actions">
+      <button class="primary" id="open-add-agent">+ Add agent</button>
+    </div>
+
+    <ul id="agent-list"></ul>
+    <p id="agents-empty" hidden>No agents configured yet.</p>
+  </details>
+
+  <dialog id="agent-dialog" aria-labelledby="agent-dialog-title">
     <form id="agent-form" autocomplete="off">
+      <h2 id="agent-dialog-title">Add agent</h2>
       <input id="agent-name" placeholder="Agent name (e.g. coder)" required maxlength="100">
       <input id="agent-command" placeholder="Command (e.g. my-agent --model x)" required maxlength="2000">
       <textarea id="agent-prompt" placeholder="Prompt template (optional) — placeholders: {id} {title} {description} {status} {priority} {due_date}" rows="4" maxlength="2000"></textarea>
@@ -279,14 +289,11 @@
       </div>
       <div class="form-actions">
         <button class="primary" id="agent-submit" type="submit">Add agent</button>
-        <button class="ghost" id="agent-cancel" type="button" hidden>Cancel</button>
+        <button class="ghost" id="agent-cancel" type="button">Cancel</button>
       </div>
       <div class="row"><code>The command runs via <b>sh -c</b> and receives the rendered prompt on stdin — task content never touches the command line.</code></div>
     </form>
-
-    <ul id="agent-list"></ul>
-    <p id="agents-empty" hidden>No agents configured yet.</p>
-  </details>
+  </dialog>
 
   <section id="runs">
     <h2>Agent runs</h2>
@@ -314,7 +321,7 @@ const state = {
   selected: null,          // id of the task shown in the detail pane
   tasks: [],                // tasks matching the current filters
   agents: [],               // configured agents (id, name, command, ...)
-  agentEditing: null,       // agent id being edited in the config mask
+  agentEditing: null,       // agent id being edited in the agent dialog
   runs: [],                 // recent runs
   pollTimer: null,          // runs polling while any run is live
 };
@@ -600,7 +607,46 @@ async function removeTask(task) {
   } catch (err) { toast(err.message); }
 }
 
-// ---------- agent config mask ----------
+// ---------- agent config dialog ----------
+
+const agentDialog = $('#agent-dialog');
+
+function resetAgentForm() {
+  state.agentEditing = null;
+  $('#agent-form').reset();
+  $('#agent-submit').textContent = 'Add agent';
+  $('#agent-dialog-title').textContent = 'Add agent';
+}
+
+function openAgentDialog() {
+  $('#agent-dialog-title').textContent = state.agentEditing ? 'Edit agent' : 'Add agent';
+  agentDialog.showModal();
+  $('#agent-name').focus();
+}
+
+function closeAgentDialog() {
+  agentDialog.close();
+  resetAgentForm();
+}
+
+// Esc closes a modal <dialog> natively; either way, drop any half-finished
+// edit so the next open starts clean.
+agentDialog.addEventListener('close', resetAgentForm);
+
+$('#open-add-agent').addEventListener('click', () => {
+  resetAgentForm();
+  openAgentDialog();
+});
+
+function startAgentEdit(agent) {
+  state.agentEditing = agent.id;
+  $('#agent-name').value = agent.name;
+  $('#agent-command').value = agent.command;
+  $('#agent-prompt').value = agent.prompt_template || '';
+  $('#agent-timeout').value = agent.timeout_secs ?? '';
+  $('#agent-submit').textContent = 'Save agent';
+  openAgentDialog();
+}
 
 function renderAgents() {
   const list = $('#agent-list');
@@ -630,30 +676,11 @@ function renderAgents() {
   }
 }
 
-function startAgentEdit(agent) {
-  state.agentEditing = agent.id;
-  $('#agent-name').value = agent.name;
-  $('#agent-command').value = agent.command;
-  $('#agent-prompt').value = agent.prompt_template || '';
-  $('#agent-timeout').value = agent.timeout_secs ?? '';
-  $('#agent-submit').textContent = 'Save agent';
-  $('#agent-cancel').hidden = false;
-  $('#agents-section').open = true;
-  $('#agent-name').focus();
-}
-
-function stopAgentEditing() {
-  state.agentEditing = null;
-  $('#agent-form').reset();
-  $('#agent-submit').textContent = 'Add agent';
-  $('#agent-cancel').hidden = true;
-}
-
 async function removeAgent(agent) {
   if (!confirm(`Delete agent "${agent.name}"? Tasks assigned to it lose the assignment; run history is kept.`)) return;
   try {
     await api(`/api/agents/${agent.id}`, { method: 'DELETE' });
-    if (state.agentEditing === agent.id) stopAgentEditing();
+    if (state.agentEditing === agent.id) closeAgentDialog();
     await load();
   } catch (err) { toast(err.message); }
 }
@@ -677,12 +704,12 @@ $('#agent-form').addEventListener('submit', async (e) => {
     } else {
       await api('/api/agents', { method: 'POST', body: JSON.stringify(payload) });
     }
-    stopAgentEditing();
+    closeAgentDialog();
     await load();
   } catch (err) { toast(err.message); }
 });
 
-$('#agent-cancel').addEventListener('click', stopAgentEditing);
+$('#agent-cancel').addEventListener('click', closeAgentDialog);
 
 // ---------- runs ----------
 
