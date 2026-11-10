@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, Row, TransactionBehavior};
 
-use crate::models::{CreateTask, Stats, Task, UpdateTask};
+use crate::models::{CreateTask, Priority, Stats, Status, Task, UpdateTask};
 
 /// Shared handle passed into the web server's router.
 pub type SharedDb = Arc<Mutex<Db>>;
@@ -16,8 +16,10 @@ pub struct Db {
 impl Db {
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
-        // WAL + busy timeout so the dashboard and the MCP server can safely
-        // share one database file from separate processes.
+        // WAL + busy timeout so a second `serve` instance (or an external
+        // sqlite3 CLI session) can read and write the same file while this
+        // process runs. The MCP bridge does not need this: it never touches
+        // the database, it forwards every call over HTTP to this process.
         let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
         conn.execute_batch(
@@ -62,9 +64,12 @@ impl Db {
     }
 
     pub fn get(&self, id: i64) -> rusqlite::Result<Option<Task>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {COLUMNS} FROM tasks WHERE id = ?1"))?;
+        Self::get_on(&self.conn, id)
+    }
+
+    /// `get` against any connection — or an open transaction (see `update`).
+    fn get_on(conn: &Connection, id: i64) -> rusqlite::Result<Option<Task>> {
+        let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM tasks WHERE id = ?1"))?;
         let mut rows = stmt.query_map(params![id], Self::row_to_task)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -81,8 +86,14 @@ impl Db {
             .map(str::trim)
             .unwrap_or_default()
             .to_string();
-        let status = input.status.clone().unwrap_or_else(|| "todo".to_string());
-        let priority = input.priority.clone().unwrap_or_else(|| "medium".to_string());
+        let status = input
+            .status
+            .clone()
+            .unwrap_or_else(|| Status::Todo.as_str().to_string());
+        let priority = input
+            .priority
+            .clone()
+            .unwrap_or_else(|| Priority::Medium.as_str().to_string());
         let due_date = normalize_due(&input.due_date);
 
         self.conn.execute(
@@ -91,23 +102,42 @@ impl Db {
             params![title, description, status, priority, due_date, now],
         )?;
         let id = self.conn.last_insert_rowid();
-        self.get(id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+        // The row was just inserted through this connection and cannot have
+        // been deleted in between (single connection behind a mutex), so a
+        // missing row here means a broken invariant, not a normal failure.
+        Ok(self.get(id)?.expect("row just inserted must be readable"))
     }
 
     /// Merge `input` into the existing task. Returns `None` if the id is unknown.
-    pub fn update(&self, id: i64, input: &UpdateTask) -> rusqlite::Result<Option<Task>> {
-        let Some(existing) = self.get(id)? else {
-            return Ok(None);
+    ///
+    /// The read-modify-write runs inside an IMMEDIATE transaction so that a
+    /// concurrent writer on the same database file (a second `serve`
+    /// instance, an external sqlite3 session) cannot slip a change in
+    /// between the read and the write — it would be silently overwritten.
+    ///
+    /// A blank title is an error here as well as at the API boundary: one
+    /// policy, enforced at both layers, so a future caller that skips the
+    /// web validation cannot silently keep a stale title.
+    pub fn update(&mut self, id: i64, input: &UpdateTask) -> Result<Option<Task>, UpdateError> {
+        let title = match input.title.as_deref() {
+            None => None, // not provided -> keep the current title
+            Some(t) => {
+                let t = t.trim();
+                if t.is_empty() {
+                    return Err(UpdateError::BlankTitle);
+                }
+                Some(t.to_string())
+            }
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(existing) = Self::get_on(&tx, id)? else {
+            return Ok(None); // tx drops -> rollback; nothing was written
         };
         let merged = Task {
             id,
-            title: input
-                .title
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or(existing.title),
+            title: title.unwrap_or(existing.title),
             description: input
                 .description
                 .as_deref()
@@ -124,7 +154,7 @@ impl Db {
             created_at: existing.created_at,
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
-        self.conn.execute(
+        let changed = tx.execute(
             "UPDATE tasks
              SET title = ?1, description = ?2, status = ?3, priority = ?4, due_date = ?5, updated_at = ?6
              WHERE id = ?7",
@@ -138,6 +168,8 @@ impl Db {
                 id
             ],
         )?;
+        debug_assert_eq!(changed, 1, "the row was read inside this transaction");
+        tx.commit()?;
         Ok(Some(merged))
     }
 
@@ -147,6 +179,10 @@ impl Db {
     }
 
     /// Aggregate counters for the dashboard header.
+    ///
+    /// "Overdue" compares against UTC midnight (`date('now')`), matching the
+    /// dashboard's `toISOString()` comparison — one deliberate timezone for
+    /// both sides, so a task flips overdue at the same moment everywhere.
     pub fn stats(&self) -> rusqlite::Result<Stats> {
         self.conn.query_row(
             "SELECT COUNT(*),
@@ -171,6 +207,38 @@ impl Db {
     }
 }
 
+/// Failure modes of [`Db::update`], kept distinct so a blank title (a client
+/// error, 400) is not conflated with a database failure (500).
+#[derive(Debug)]
+pub enum UpdateError {
+    BlankTitle,
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateError::BlankTitle => write!(f, "title must not be empty"),
+            UpdateError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for UpdateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            UpdateError::BlankTitle => None,
+            UpdateError::Db(e) => Some(e),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for UpdateError {
+    fn from(e: rusqlite::Error) -> Self {
+        UpdateError::Db(e)
+    }
+}
+
 /// Treat a missing or whitespace-only due date as "no due date".
 fn normalize_due(due: &Option<String>) -> Option<String> {
     due.as_deref()
@@ -182,7 +250,6 @@ fn normalize_due(due: &Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{CreateTask, UpdateTask};
 
     fn db() -> Db {
         Db::open(":memory:").expect("open in-memory db")
@@ -217,7 +284,7 @@ mod tests {
 
     #[test]
     fn update_merges_fields_and_can_clear_due_date() {
-        let db = db();
+        let mut db = db();
         let mut input = create("Ship it");
         input.due_date = Some("2999-01-01".into());
         input.priority = Some("high".into());
@@ -225,7 +292,7 @@ mod tests {
         assert_eq!(task.priority, "high");
 
         let patch = UpdateTask {
-            title: Some("  ".into()), // blank title is ignored, old value kept
+            title: None, // omitted -> keep the current title
             description: None,
             status: Some("done".into()),
             priority: None,
@@ -238,6 +305,23 @@ mod tests {
         assert!(updated.due_date.is_none());
 
         assert!(db.update(42, &patch).unwrap().is_none());
+    }
+
+    #[test]
+    fn update_rejects_blank_title() {
+        let mut db = db();
+        let task = db.create(&create("Ship it")).unwrap();
+
+        let patch = UpdateTask {
+            title: Some("   ".into()),
+            ..UpdateTask::default()
+        };
+        assert!(matches!(
+            db.update(task.id, &patch),
+            Err(UpdateError::BlankTitle)
+        ));
+        // the rejected update left the row untouched
+        assert_eq!(db.get(task.id).unwrap().unwrap().title, "Ship it");
     }
 
     #[test]

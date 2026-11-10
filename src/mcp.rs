@@ -5,7 +5,9 @@
 //! server that serves the dashboard), so there is exactly one process that
 //! owns the database and all clients — browser, scripts, LLM — see the same
 //! data. The server's base URL comes from `ORGA_URL` (default
-//! `http://127.0.0.1:3000`).
+//! `http://127.0.0.1:3000`). If the server was started with `ORGA_TOKEN`,
+//! the same variable must be set for the bridge so its requests carry the
+//! bearer token.
 //!
 //! Wire format: JSON-RPC 2.0, one message per line (Model Context Protocol,
 //! revision 2025-06-18). Notifications (messages without an "id") are accepted
@@ -18,19 +20,34 @@ use std::io::{self, BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::models::{check_enum, PRIORITIES, STATUSES};
+use crate::models::{check_due_date, check_enum, check_title, PRIORITIES, STATUSES};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "orga-rs";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Text produced by a tool, or an error message aimed at the model.
-type ToolResult = Result<String, String>;
+/// What a successful tool call produces: text aimed at the model, plus — for
+/// tools that declare an `outputSchema` — the same data as structured content.
+struct ToolOutput {
+    text: String,
+    structured: Option<Value>,
+}
+
+impl ToolOutput {
+    fn text(text: String) -> Self {
+        Self { text, structured: None }
+    }
+}
+
+/// A tool's output, or an error message aimed at the model.
+type ToolResult = Result<ToolOutput, String>;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let base = std::env::var("ORGA_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
     let base = base.trim_end_matches('/');
-    let api = Api::new(base);
+    // Sent as a bearer token on every request when the server requires one.
+    let token = std::env::var("ORGA_TOKEN").ok().filter(|t| !t.trim().is_empty());
+    let api = Api::new(base, token);
     eprintln!("{SERVER_NAME} MCP bridge ready (server: {base})");
     serve(io::stdin().lock(), io::stdout().lock(), &api)
 }
@@ -58,14 +75,7 @@ fn serve<R: BufRead, W: Write>(
         let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
 
         let response = match method {
-            "initialize" => respond(
-                id,
-                Ok(json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-                })),
-            ),
+            "initialize" => respond(id, Ok(initialize_result())),
             "ping" => respond(id, Ok(json!({}))),
             "tools/list" => respond(id, Ok(json!({ "tools": tool_definitions() }))),
             "tools/call" => respond(id, call_tool(api, &params)),
@@ -81,6 +91,20 @@ fn serve<R: BufRead, W: Write>(
         writer.flush()?;
     }
     Ok(())
+}
+
+/// The `initialize` result, including spec-optional `instructions` that tell
+/// the model how to use the tools well (due-date format, update semantics).
+fn initialize_result() -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": { "tools": { "listChanged": false } },
+        "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
+        "instructions": "Tools manage a task list. Statuses are todo/in_progress/done, \
+priorities low/medium/high. due_date must be a real calendar date formatted YYYY-MM-DD. \
+On update_task, omit fields you do not want to change and pass due_date as an empty \
+string to clear it. Use task_stats for a quick summary."
+    })
 }
 
 fn respond(id: Value, result: Result<Value, Value>) -> Value {
@@ -118,14 +142,19 @@ fn call_tool(api: &Api, params: &Value) -> Result<Value, Value> {
         }
     };
 
-    let (text, is_error) = match outcome {
-        Ok(text) => (text, false),
-        Err(msg) => (msg, true),
+    let (output, is_error) = match outcome {
+        Ok(output) => (output, false),
+        Err(msg) => (ToolOutput::text(msg), true),
     };
-    Ok(json!({
-        "content": [{ "type": "text", "text": text }],
+    let mut result = json!({
+        "content": [{ "type": "text", "text": output.text }],
         "isError": is_error,
-    }))
+    });
+    // Structured content is only meaningful for successful calls.
+    if let Some(structured) = output.structured {
+        result["structuredContent"] = structured;
+    }
+    Ok(result)
 }
 
 // ---------- tool implementations (HTTP calls to the server) ----------
@@ -140,40 +169,72 @@ fn tool_list_tasks(api: &Api, args: &Value) -> ToolResult {
         ),
         "list tasks",
     )?;
-    if tasks.as_array().is_none_or(|t| t.is_empty()) {
-        return Ok("No tasks found.".to_string());
+    let Some(arr) = tasks.as_array() else {
+        return Err("server returned an unexpected response".to_string());
+    };
+    if arr.is_empty() {
+        return Ok(ToolOutput::text("No tasks found.".to_string()));
     }
-    to_text(&tasks)
+    // One line per task keeps long lists compact for the model;
+    // get_task returns the full record.
+    let mut lines = vec![format!(
+        "{} task{}:",
+        arr.len(),
+        if arr.len() == 1 { "" } else { "s" }
+    )];
+    for task in arr {
+        lines.push(task_line(task));
+    }
+    Ok(ToolOutput::text(lines.join("\n")))
+}
+
+/// One-line task summary, e.g. `#3 [high] [todo] Ship it (due 2026-11-10)`.
+fn task_line(task: &Value) -> String {
+    let field = |key: &str| task.get(key).and_then(Value::as_str).unwrap_or("");
+    let id = task.get("id").and_then(Value::as_i64).unwrap_or_default();
+    let mut line = format!(
+        "#{id} [{}] [{}] {}",
+        field("priority"),
+        field("status"),
+        field("title")
+    );
+    if let Some(due) = task.get("due_date").and_then(Value::as_str) {
+        line.push_str(&format!(" (due {due})"));
+    }
+    line
 }
 
 fn tool_get_task(api: &Api, args: &Value) -> ToolResult {
     let id = req_id(args)?;
     let task = api.get_json(&format!("/api/tasks/{id}"), "fetch task")?;
-    to_text(&task)
+    to_text(&task).map(ToolOutput::text)
 }
 
 fn tool_create_task(api: &Api, args: &Value) -> ToolResult {
     let body = validate_task_body(args, false)?;
     let task = api.post_json("/api/tasks", &body, "create task")?;
-    to_text(&task)
+    to_text(&task).map(ToolOutput::text)
 }
 
 fn tool_update_task(api: &Api, args: &Value) -> ToolResult {
     let id = req_id(args)?;
     let body = validate_task_body(args, true)?;
     let task = api.put_json(&format!("/api/tasks/{id}"), &body, "update task")?;
-    to_text(&task)
+    to_text(&task).map(ToolOutput::text)
 }
 
 fn tool_delete_task(api: &Api, args: &Value) -> ToolResult {
     let id = req_id(args)?;
     api.delete(&format!("/api/tasks/{id}"), "delete task")?;
-    Ok(format!("task {id} deleted"))
+    Ok(ToolOutput::text(format!("task {id} deleted")))
 }
 
 fn tool_task_stats(api: &Api) -> ToolResult {
     let stats = api.get_json("/api/stats", "fetch stats")?;
-    to_text(&stats)
+    // Compact text for the model, plus structuredContent matching the tool's
+    // declared outputSchema (MCP 2025-06-18 structured outputs).
+    let text = serde_json::to_string(&stats).map_err(|e| format!("serialization error: {e}"))?;
+    Ok(ToolOutput { text, structured: Some(stats) })
 }
 
 /// Validate the task fields of a create/update call before sending them to
@@ -185,20 +246,16 @@ fn validate_task_body(args: &Value, is_update: bool) -> Result<Value, String> {
         obj.remove("id");
     }
     if !is_update {
-        let title = args
-            .get("title")
+        args.get("title")
             .and_then(Value::as_str)
             .ok_or("missing required argument: title")?;
-        if title.trim().is_empty() {
-            return Err("title must not be empty".to_string());
-        }
-    } else if let Some(title) = args.get("title").and_then(Value::as_str) {
-        if title.trim().is_empty() {
-            return Err("title must not be empty".to_string());
-        }
+    }
+    if let Some(title) = args.get("title").and_then(Value::as_str) {
+        check_title(title)?;
     }
     check_enum("status", opt_string(args, "status")?.as_deref(), &STATUSES)?;
     check_enum("priority", opt_string(args, "priority")?.as_deref(), &PRIORITIES)?;
+    check_due_date(opt_string(args, "due_date")?.as_deref())?;
     Ok(body)
 }
 
@@ -207,13 +264,15 @@ fn validate_task_body(args: &Value, is_update: bool) -> Result<Value, String> {
 /// Minimal HTTP client for the server's JSON API.
 struct Api {
     base: String,
+    token: Option<String>,
     agent: ureq::Agent,
 }
 
 impl Api {
-    fn new(base: &str) -> Self {
+    fn new(base: &str, token: Option<String>) -> Self {
         Self {
             base: base.to_string(),
+            token,
             // Generous timeout: the model may think between calls, but a hung
             // server should not block the MCP client forever.
             agent: ureq::AgentBuilder::new()
@@ -224,13 +283,16 @@ impl Api {
 
     fn request(&self, method: &str, path: &str, body: Option<&Value>, what: &str) -> Result<Value, String> {
         let url = format!("{}{}", self.base, path);
+        let mut request = self.agent.request(method, &url);
+        if let Some(token) = &self.token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
         let result = if let Some(json) = body {
-            self.agent
-                .request(method, &url)
+            request
                 .set("Content-Type", "application/json")
-                .send_json(json.clone())
+                .send_json(json) // &Value implements Serialize; no clone needed
         } else {
-            self.agent.request(method, &url).call()
+            request.call()
         };
         let response = match result {
             Ok(res) => HttpResponse {
@@ -330,9 +392,18 @@ fn urlencode(s: &str) -> String {
 // ---------- tool definitions (tools/list) ----------
 
 fn tool_definitions() -> Value {
-    let status_enum = json!(["todo", "in_progress", "done"]);
-    let priority_enum = json!(["low", "medium", "high"]);
+    // The enums come straight from the models so the schema cannot drift
+    // from what the server accepts.
+    let status_enum = json!(STATUSES);
+    let priority_enum = json!(PRIORITIES);
     let id_schema = json!({ "type": "integer", "description": "Task id." });
+    let due_date_schema = json!({
+        "type": "string",
+        "description": "Due date as YYYY-MM-DD, or an empty string for no due date.",
+        // The empty alternative matters: "" is the documented way to clear a
+        // due date on update, and a strict client would otherwise reject it.
+        "pattern": "^(\\d{4}-\\d{2}-\\d{2})?$"
+    });
     json!([
         {
             "name": "list_tasks",
@@ -362,11 +433,15 @@ default to status=todo, priority=medium, no due date.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "title": { "type": "string", "description": "Short task title." },
+                    "title": {
+                        "type": "string",
+                        "description": "Short task title.",
+                        "maxLength": crate::models::MAX_TITLE_LEN
+                    },
                     "description": { "type": "string", "description": "Optional details." },
                     "status": { "type": "string", "enum": status_enum },
                     "priority": { "type": "string", "enum": priority_enum },
-                    "due_date": { "type": "string", "description": "Due date as YYYY-MM-DD." }
+                    "due_date": due_date_schema
                 },
                 "required": ["title"]
             }
@@ -379,11 +454,15 @@ given; omitted fields keep their current value. Pass due_date as an empty string
                 "type": "object",
                 "properties": {
                     "id": id_schema,
-                    "title": { "type": "string" },
+                    "title": { "type": "string", "maxLength": crate::models::MAX_TITLE_LEN },
                     "description": { "type": "string" },
                     "status": { "type": "string", "enum": status_enum },
                     "priority": { "type": "string", "enum": priority_enum },
-                    "due_date": { "type": "string", "description": "YYYY-MM-DD, or \"\" to clear." }
+                    "due_date": {
+                        "type": "string",
+                        "description": "YYYY-MM-DD, or \"\" to clear.",
+                        "pattern": "^(\\d{4}-\\d{2}-\\d{2})?$"
+                    }
                 },
                 "required": ["id"]
             }
@@ -400,14 +479,25 @@ given; omitted fields keep their current value. Pass due_date as an empty string
         {
             "name": "task_stats",
             "description": "Aggregate counters: total, todo, in_progress, done and overdue.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "inputSchema": { "type": "object", "properties": {} },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "total": { "type": "integer" },
+                    "todo": { "type": "integer" },
+                    "in_progress": { "type": "integer" },
+                    "done": { "type": "integer" },
+                    "overdue": { "type": "integer" }
+                },
+                "required": ["total", "todo", "in_progress", "done", "overdue"]
+            }
         }
     ])
 }
 
 // ---------- argument helpers ----------
 
-fn to_text(value: &impl serde::Serialize) -> ToolResult {
+fn to_text(value: &impl serde::Serialize) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|e| format!("serialization error: {e}"))
 }
 
@@ -467,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_task_body_strips_id_and_checks_enums() {
+    fn validate_task_body_strips_id_and_checks_fields() {
         let body = validate_task_body(
             &json!({ "id": 5, "title": "ok", "status": "done", "priority": "high" }),
             false,
@@ -478,8 +568,24 @@ mod tests {
         assert!(validate_task_body(&json!({ "title": "x", "status": "bogus" }), false).is_err());
         assert!(validate_task_body(&json!({ "status": "done" }), false).is_err()); // no title
         assert!(validate_task_body(&json!({ "title": "  " }), false).is_err()); // blank title
-        // updates may omit the title entirely
+        assert!(validate_task_body(&json!({ "title": "x", "due_date": "tomorrow" }), false).is_err());
+        assert!(validate_task_body(&json!({ "title": "x", "due_date": "2026-1-5" }), false).is_err());
+        assert!(validate_task_body(&json!({ "title": "x", "due_date": "2026-11-10" }), false).is_ok());
+        // updates may omit the title entirely; "" clears the due date
         assert!(validate_task_body(&json!({ "status": "done" }), true).is_ok());
+        assert!(validate_task_body(&json!({ "due_date": "" }), true).is_ok());
+    }
+
+    #[test]
+    fn task_line_summarizes_a_task() {
+        let line = task_line(&json!({
+            "id": 3, "title": "Ship it", "status": "todo", "priority": "high",
+            "due_date": "2026-11-10"
+        }));
+        assert_eq!(line, "#3 [high] [todo] Ship it (due 2026-11-10)");
+
+        let line = task_line(&json!({ "id": 1, "title": "Bare", "status": "done", "priority": "low" }));
+        assert_eq!(line, "#1 [low] [done] Bare");
     }
 
     // ---------- stdio loop against a real server ----------
@@ -490,7 +596,7 @@ mod tests {
         let db: crate::db::SharedDb = std::sync::Arc::new(std::sync::Mutex::new(
             crate::db::Db::open(":memory:").unwrap(),
         ));
-        let app = crate::web::router(db);
+        let app = crate::web::router(db, None);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap(); // required by tokio's from_std
         let addr = listener.local_addr().unwrap();
@@ -505,7 +611,7 @@ mod tests {
                     .unwrap();
             });
         });
-        (Api::new(&format!("http://{addr}")), addr.port())
+        (Api::new(&format!("http://{addr}"), None), addr.port())
     }
 
     fn session(api: &Api, input: &str) -> Vec<Value> {
@@ -537,9 +643,12 @@ mod tests {
         assert_eq!(responses.len(), 9); // the notification got no reply
         assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(responses[0]["result"]["serverInfo"]["name"], "orga-rs");
+        assert!(responses[0]["result"]["instructions"].as_str().unwrap().contains("YYYY-MM-DD"));
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 6);
+        let stats_tool = tools.iter().find(|t| t["name"] == "task_stats").unwrap();
+        assert!(stats_tool["outputSchema"].is_object());
 
         let created = responses[2]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(created.contains("From stdio"));
@@ -547,12 +656,14 @@ mod tests {
 
         let listed = responses[3]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(listed.contains("From stdio"));
+        assert!(listed.contains("#1 [high] [todo]"));
 
         let updated = responses[4]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(updated.contains("\"status\": \"done\""));
 
         let stats = responses[5]["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(stats.contains("\"done\": 1"));
+        assert!(stats.contains("\"done\":1")); // compact, one line
+        assert_eq!(responses[5]["result"]["structuredContent"]["done"], 1);
 
         assert!(responses[6]["result"]["content"][0]["text"]
             .as_str()
@@ -570,9 +681,41 @@ mod tests {
     }
 
     #[test]
+    fn stdio_due_date_roundtrip_and_validation() {
+        let (api, _port) = spawn_server();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_task","arguments":{"title":"dated","due_date":"2999-01-01"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"update_task","arguments":{"id":1,"due_date":""}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_task","arguments":{"title":"bad","due_date":"tomorrow"}}}"#, "\n",
+        );
+        let responses = session(&api, input);
+
+        // create with a valid date
+        assert_eq!(responses[0]["result"]["isError"], false);
+        assert!(responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("2999-01-01"));
+
+        // an empty string clears the due date end-to-end
+        assert_eq!(responses[1]["result"]["isError"], false);
+        assert!(responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"due_date\": null"));
+
+        // an invalid date is rejected before the round-trip, with a precise message
+        assert_eq!(responses[2]["result"]["isError"], true);
+        assert!(responses[2]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("invalid due_date 'tomorrow'"));
+    }
+
+    #[test]
     fn unreachable_server_is_a_tool_error_with_hint() {
         // Port 1 is reserved and nothing listens there.
-        let api = Api::new("http://127.0.0.1:1");
+        let api = Api::new("http://127.0.0.1:1", None);
         let responses = session(
             &api,
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_tasks","arguments":{}}}"#,

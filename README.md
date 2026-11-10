@@ -33,6 +33,24 @@ with the `ORGA_DB` environment variable. The MCP bridge connects to
 `http://127.0.0.1:3000` by default; override with `ORGA_URL` (e.g. when the
 server runs on another machine or port).
 
+### Security
+
+**The API has no authentication by default.** It is designed for a single
+user on a trusted machine, and the default bind address (`127.0.0.1`) keeps
+it local. If you bind to `0.0.0.0` or another reachable address, anyone on
+that network can read, modify and delete your tasks. For anything beyond a
+trusted network, set a shared token:
+
+```sh
+ORGA_TOKEN=some-secret cargo run -- serve 0.0.0.0:8080
+```
+
+With `ORGA_TOKEN` set, every `/api/*` request must carry
+`Authorization: Bearer some-secret` (the dashboard page itself stays open —
+it contains no data). The MCP bridge reads the same variable and sends the
+token along; set it in the client's `env` block too. On Ctrl-C or SIGTERM the
+server stops accepting connections and lets in-flight requests finish.
+
 ## Web dashboard
 
 Open http://127.0.0.1:3000 — a single-page dashboard (no build step, no
@@ -53,9 +71,13 @@ JavaScript framework) that talks to the REST API:
 | `DELETE` | `/api/tasks/{id}`| delete                                   |
 | `GET`    | `/api/stats`     | counters incl. overdue                   |
 
-Task fields: `title`, `description`, `status` (`todo`/`in_progress`/`done`),
-`priority` (`low`/`medium`/`high`), `due_date` (`YYYY-MM-DD` or null).
-On `PUT`, an empty string for `due_date` clears it; omitting the field keeps it.
+Task fields: `title` (required, 1–200 characters), `description`, `status`
+(`todo`/`in_progress`/`done`), `priority` (`low`/`medium`/`high`), `due_date`
+(`YYYY-MM-DD` — a real calendar date — or null). On `PUT`, an empty string for
+`due_date` clears it; omitting the field keeps it. Invalid values (unknown
+status/priority, malformed dates, blank or over-long titles, unknown filter
+values on the list endpoint) are rejected with `400` and a message in
+`{"error": "..."}`.
 
 ## MCP tools
 
@@ -79,6 +101,9 @@ then register the bridge in any stdio MCP client (Claude Desktop, etc.):
   }
 }
 ```
+
+If the server runs with `ORGA_TOKEN`, add it to the same `env` block so the
+bridge can authenticate.
 
 Use an **absolute path** to the binary — MCP clients often don't inherit your
 working directory. If the server is not running, tool calls fail with a clear
