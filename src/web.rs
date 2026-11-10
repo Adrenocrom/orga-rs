@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, MutexGuard};
@@ -6,19 +7,24 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::json;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt as _;
 
 use crate::db::{Db, SharedDb, UpdateError};
 use crate::models::{
     check_enum, check_workdir, Agent, CreateAgent, CreateTask, Run, Stats, Task, UpdateAgent,
     UpdateTask, PRIORITIES, RUN_STATUSES, STATUSES,
 };
-use crate::runner::{self, AgentSlots, RunRegistry, SharedRegistry};
+use crate::runner::{self, AgentSlots, RunEvent, RunRegistry, SharedRegistry};
 
 /// Router state: the database, the live-run registry and the per-agent
 /// execution slots (one live run per agent).
@@ -102,7 +108,12 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
             get(get_agent).put(update_agent).delete(delete_agent),
         )
         .route("/api/runs", get(list_runs))
-        .route("/api/runs/{id}", get(get_run).delete(cancel_run))
+        .route(
+            "/api/runs/{id}",
+            get(get_run).delete(delete_run),
+        )
+        .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/stream", get(stream_run))
         .route("/api/stats", get(get_stats))
         .route_layer(middleware::from_fn_with_state(token, require_token))
         .with_state(state);
@@ -444,6 +455,129 @@ async fn cancel_run(
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err(AppError::Conflict("run is not queued or running".to_string())),
+    }
+}
+
+/// Delete a run record. A live run is stopped first, then its row is
+/// removed — the run disappears from history entirely. 404 when the run
+/// row does not exist.
+async fn delete_run(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    // One lock across the status check and the delete: the queue's pickup
+    // needs the same lock, so a queued run cannot be started in between —
+    // no process is ever spawned for a row that is about to disappear.
+    // (Calling registry.cancel under the DB lock is safe: it only touches
+    // the registry's own mutex and never the database.)
+    let deleted = {
+        let guard = lock_db(&state.db)?;
+        let run = guard.get_run(id)?.ok_or(AppError::NotFound)?;
+        if run.status == "running" {
+            // Ask the live process to stop. `false` means no live
+            // supervisor exists (e.g. the server restarted mid-run) —
+            // nothing to kill. Either way the supervisor tolerates its
+            // final write landing on a row that is already gone, and
+            // still releases the agent's slot.
+            state.registry.cancel(id);
+        }
+        guard.delete_run(id)?
+    };
+    if !deleted {
+        return Err(AppError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- live run streaming (SSE) ----------
+
+/// The SSE response of [`stream_run`]: boxed so the live path (replay +
+/// broadcast stream) and the finished path (a plain iterator) share one
+/// concrete type; `KeepAliveStream` because both use a keep-alive.
+type RunSse = Sse<
+    axum::response::sse::KeepAliveStream<
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>>,
+    >,
+>;
+
+/// Box a stream into the trait object [`RunSse`] expects. The explicit
+/// return type is the coercion site — `Box::pin(x)` alone keeps the
+/// concrete type.
+fn boxed_stream(
+    stream: impl tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static,
+) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>> {
+    Box::pin(stream)
+}/// Stream the conversation of a run as Server-Sent Events:
+///
+/// - `event: prompt`  — the prompt the agent received on stdin
+/// - `event: output`  — a chunk of the agent's stdout/stderr, in arrival order
+/// - `event: status`  — a lifecycle note (`queued`, `running`, `completed`, …)
+/// - `event: resync`  — the client lagged behind the broadcast channel;
+///   re-fetch the run to see the full output
+/// - `event: end`     — the run reached a final status; the stream closes
+///
+/// A live run (queued or running) is followed until it ends. A finished
+/// run replays its stored output as one `output` event and closes — the
+/// endpoint is a uniform way to watch any run. Unknown runs are 404.
+///
+/// The replayed events carry an `id:` field (the stream's sequence number)
+/// so a client that reconnects with `Last-Event-ID` can skip what it has
+/// already seen; live events carry no id (they are not replayable).
+async fn stream_run(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<RunSse, AppError> {
+    // The registry lookup and the DB read happen in this order on purpose:
+    // a run that ends between the two checks is served from the registry
+    // (its final events are still in the replay buffer), and a run that is
+    // not in the registry is served from the DB — the two paths cannot
+    // both miss a run that exists.
+    let Some((replay, live)) = state.registry.subscribe(id) else {
+        // Not live: either finished (serve the stored output) or unknown.
+        let run = lock_db(&state.db)?.get_run(id)?.ok_or(AppError::NotFound)?;
+        let mut events = vec![Ok(sse_event(None, &RunEvent::Status(run.status.clone())))];
+        if !run.output.is_empty() {
+            events.push(Ok(sse_event(None, &RunEvent::Output(run.output.clone()))));
+        }
+        events.push(Ok(sse_event(None, &RunEvent::End)));
+        return Ok(Sse::new(boxed_stream(tokio_stream::iter(events)))
+            .keep_alive(KeepAlive::default()));
+    };
+
+    // Replay first (with sequence ids), then everything the run still does.
+    // The broadcast receiver is created before the replay is read, so no
+    // event can be missed in between; the supervisor's `end` event closes
+    // the stream (it drops the last sender when it finishes).
+    let replay_iter = replay
+        .into_iter()
+        .map(|(seq, event)| Ok(sse_event(Some(seq), &event)));
+    let live_stream = BroadcastStream::new(live).filter_map(|event| match event {
+        Ok(event) => Some(Ok(sse_event(None, &event))),
+        // The client fell behind the broadcast channel: tell it to re-fetch
+        // instead of silently showing a gap.
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => {
+            Some(Ok(Event::default().event("resync")))
+        }
+    });
+    Ok(Sse::new(boxed_stream(
+        tokio_stream::iter(replay_iter).chain(live_stream),
+    ))
+    .keep_alive(KeepAlive::default()))
+}
+
+/// One SSE event from a run event. `seq` is attached as the SSE id when the
+/// event comes from the replay buffer (so a reconnecting client can skip
+/// it); live events have no id.
+fn sse_event(seq: Option<u64>, event: &RunEvent) -> Event {
+    let mut builder = Event::default();
+    if let Some(seq) = seq {
+        builder = builder.id(seq.to_string());
+    }
+    match event {
+        RunEvent::Prompt(text) => builder.event("prompt").data(text.clone()),
+        RunEvent::Output(text) => builder.event("output").data(text.clone()),
+        RunEvent::Status(text) => builder.event("status").data(text.clone()),
+        RunEvent::End => builder.event("end"),
     }
 }
 
@@ -874,6 +1008,17 @@ mod tests {
         assert_eq!(agent["name"], "coder v2");
         assert_eq!(agent["command"], "echo done");
 
+        // timeout 0 means "no timeout" and round-trips as 0, not null
+        let res = call(
+            &app,
+            "PUT",
+            &format!("/api/agents/{id}"),
+            Some(r#"{"timeout_secs":0}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["timeout_secs"], 0);
+
         // unknown id -> 404
         let res = call(&app, "PUT", "/api/agents/999", Some(r#"{"name":"x"}"#)).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
@@ -978,7 +1123,7 @@ mod tests {
         let run_id = body_json(res).await["id"].as_i64().unwrap();
 
         // cancel the live run
-        let res = call(&app, "DELETE", &format!("/api/runs/{run_id}"), None).await;
+        let res = call(&app, "POST", &format!("/api/runs/{run_id}/cancel"), None).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
         // wait for the supervisor to record the cancellation
@@ -994,11 +1139,11 @@ mod tests {
         assert_eq!(status, "cancelled");
 
         // cancelling again -> 409 (no longer running)
-        let res = call(&app, "DELETE", &format!("/api/runs/{run_id}"), None).await;
+        let res = call(&app, "POST", &format!("/api/runs/{run_id}/cancel"), None).await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
 
         // unknown run -> 404
-        let res = call(&app, "DELETE", "/api/runs/999", None).await;
+        let res = call(&app, "POST", "/api/runs/999/cancel", None).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
         // the agent_id given in the body was also assigned to the task
@@ -1118,7 +1263,7 @@ mod tests {
 
         // Cancelling the first run frees the slot; the queued run starts
         // and completes.
-        let res = call(&app, "DELETE", &format!("/api/runs/{}", first["id"]), None).await;
+        let res = call(&app, "POST", &format!("/api/runs/{}/cancel", first["id"]), None).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
         let mut second_status = String::new();
@@ -1166,10 +1311,95 @@ mod tests {
         .await;
         let fourth = body_json(res).await;
         assert_eq!(fourth["status"], "queued");
-        let res = call(&app, "DELETE", &format!("/api/runs/{}", fourth["id"]), None).await;
+        let res = call(&app, "POST", &format!("/api/runs/{}/cancel", fourth["id"]), None).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         let res = call(&app, "GET", &format!("/api/runs/{}", fourth["id"]), None).await;
         assert_eq!(body_json(res).await["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn runs_can_be_deleted() {
+        let app = app();
+        let (task_id, agent_id) = seed_task_agent(&app).await;
+
+        // A completed run can be deleted outright.
+        let res = call(
+            &app,
+            "POST",
+            &format!("/api/tasks/{task_id}/run"),
+            Some(&format!(r#"{{"agent_id":{agent_id}}}"#)),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let run_id = body_json(res).await["id"].as_i64().unwrap();
+        for _ in 0..100 {
+            let res = call(&app, "GET", &format!("/api/runs/{run_id}"), None).await;
+            if body_json(res).await["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let res = call(&app, "DELETE", &format!("/api/runs/{run_id}"), None).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = call(&app, "GET", &format!("/api/runs/{run_id}"), None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Deleting again -> 404 (the row is gone).
+        let res = call(&app, "DELETE", &format!("/api/runs/{run_id}"), None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // A live run is stopped first, then its row is removed.
+        let res = call(
+            &app,
+            "POST",
+            "/api/agents",
+            Some(r#"{"name":"sleeper","command":"sleep 60","timeout_secs":60}"#),
+        )
+        .await;
+        let sleeper_id = body_json(res).await["id"].as_i64().unwrap();
+        let res = call(
+            &app,
+            "POST",
+            &format!("/api/tasks/{task_id}/run"),
+            Some(&format!(r#"{{"agent_id":{sleeper_id}}}"#)),
+        )
+        .await;
+        let live_id = body_json(res).await["id"].as_i64().unwrap();
+
+        let res = call(&app, "DELETE", &format!("/api/runs/{live_id}"), None).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = call(&app, "GET", &format!("/api/runs/{live_id}"), None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // The slot freed by the deletion lets the agent run again. The
+        // supervisor releases the slot asynchronously after the kill, so
+        // the fresh run may briefly queue — it must start once the slot
+        // frees (the queue picks it up automatically).
+        let res = call(
+            &app,
+            "POST",
+            &format!("/api/tasks/{task_id}/run"),
+            Some(&format!(r#"{{"agent_id":{sleeper_id}}}"#)),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let fresh_id = body_json(res).await["id"].as_i64().unwrap();
+
+        let mut status = String::new();
+        for _ in 0..200 {
+            let res = call(&app, "GET", &format!("/api/runs/{fresh_id}"), None).await;
+            status = body_json(res).await["status"].as_str().unwrap().to_string();
+            if status == "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(status, "running");
+
+        // Clean up: stop the run so the test does not leave a process.
+        let res = call(&app, "POST", &format!("/api/runs/{fresh_id}/cancel"), None).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -1217,5 +1447,178 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert!(output.trim().ends_with("tmp"), "pwd output was: {output}");
+    }
+
+    // ---------- live run streaming (SSE) ----------
+
+    /// Read an SSE response body to completion and return its frames:
+    /// one `(event, data)` pair per frame.
+    async fn sse_frames(res: Response) -> Vec<(String, String)> {
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut frames = Vec::new();
+        for frame in text.split("\n\n") {
+            if frame.trim().is_empty() {
+                continue;
+            }
+            let mut event = "message".to_string();
+            let mut data = Vec::new();
+            for line in frame.split('\n') {
+                if let Some(name) = line.strip_prefix("event:") {
+                    event = name.trim().to_string();
+                } else if let Some(payload) = line.strip_prefix("data:") {
+                    data.push(payload.strip_prefix(' ').unwrap_or(payload));
+                }
+            }
+            frames.push((event, data.join("\n")));
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_live_run_streams_its_conversation_over_sse() {
+        let app = app();
+        let (task_id, agent_id) = seed_task_agent(&app).await;
+
+        // A slow command keeps the run alive while the stream is opened.
+        let res = call(
+            &app,
+            "PUT",
+            &format!("/api/agents/{agent_id}"),
+            Some(r#"{"command":"echo part1; sleep 0.4; echo part2","timeout_secs":10}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = call(
+            &app,
+            "POST",
+            &format!("/api/tasks/{task_id}/run"),
+            Some(&format!(r#"{{"agent_id":{agent_id}}}"#)),
+        )
+        .await;
+        let run_id = body_json(res).await["id"].as_i64().unwrap();
+
+        // Attach while the run is live: the replay shows the prompt and
+        // part1, then part2 arrives live, then the run ends.
+        let res = call(&app, "GET", &format!("/api/runs/{run_id}/stream"), None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let frames = sse_frames(res).await;
+
+        let events: Vec<&str> = frames.iter().map(|(e, _)| e.as_str()).collect();
+        assert_eq!(
+            events,
+            vec!["status", "prompt", "output", "output", "status", "end"]
+        );
+        assert!(frames[1].1.contains("work on to work on"), "prompt: {}", frames[1].1);
+        assert!(frames[2].1.contains("part1"), "first chunk: {}", frames[2].1);
+        assert!(frames[3].1.contains("part2"), "second chunk: {}", frames[3].1);
+        assert_eq!(frames[4].1, "completed");
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_replays_its_stored_output_over_sse() {
+        let app = app();
+        let (task_id, agent_id) = seed_task_agent(&app).await;
+
+        let res = call(
+            &app,
+            "POST",
+            &format!("/api/tasks/{task_id}/run"),
+            Some(&format!(r#"{{"agent_id":{agent_id}}}"#)),
+        )
+        .await;
+        let run_id = body_json(res).await["id"].as_i64().unwrap();
+        for _ in 0..100 {
+            let res = call(&app, "GET", &format!("/api/runs/{run_id}"), None).await;
+            if body_json(res).await["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // The run is finished: the stream serves the stored output and
+        // closes immediately.
+        let res = call(&app, "GET", &format!("/api/runs/{run_id}/stream"), None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let frames = sse_frames(res).await;
+        let events: Vec<&str> = frames.iter().map(|(e, _)| e.as_str()).collect();
+        assert_eq!(events, vec!["status", "output", "end"]);
+        assert_eq!(frames[0].1, "completed");
+        assert!(frames[1].1.contains("work on to work on"));
+    }
+
+    #[tokio::test]
+    async fn streaming_an_unknown_run_is_404() {
+        let app = app();
+        let res = call(&app, "GET", "/api/runs/999/stream", None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_queued_run_can_be_streamed_until_it_starts_and_ends() {
+        let app = app();
+        let (task_id, agent_id) = seed_task_agent(&app).await;
+
+        // Hold the slot, then queue a second run behind it.
+        let res = call(
+            &app,
+            "PUT",
+            &format!("/api/agents/{agent_id}"),
+            Some(r#"{"command":"sleep 30","timeout_secs":60}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = call(
+            &app,
+            "POST",
+            &format!("/api/tasks/{task_id}/run"),
+            Some(&format!(r#"{{"agent_id":{agent_id}}}"#)),
+        )
+        .await;
+        let first = body_json(res).await["id"].as_i64().unwrap();
+        let res = call(
+            &app,
+            "POST",
+            &format!("/api/tasks/{task_id}/run"),
+            Some(&format!(r#"{{"agent_id":{agent_id}}}"#)),
+        )
+        .await;
+        let second = body_json(res).await["id"].as_i64().unwrap();
+
+        // Make the queued run fast, then free the slot by cancelling the
+        // first run — the queued run starts and completes.
+        let res = call(
+            &app,
+            "PUT",
+            &format!("/api/agents/{agent_id}"),
+            Some(r#"{"command":"true"}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Open the stream while the run is still queued.
+        let stream_res = call(&app, "GET", &format!("/api/runs/{second}/stream"), None).await;
+        assert_eq!(stream_res.status(), StatusCode::OK);
+
+        let res = call(&app, "POST", &format!("/api/runs/{first}/cancel"), None).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // The queued run's stream must reach the end after the pickup.
+        let frames = sse_frames(stream_res).await;
+        let events: Vec<&str> = frames.iter().map(|(e, _)| e.as_str()).collect();
+        assert_eq!(
+            events,
+            vec!["status", "status", "prompt", "status", "end"]
+        );
+        assert_eq!(frames[0].1, "queued");
+        assert_eq!(frames[1].1, "running");
+        assert_eq!(frames[3].1, "completed");
     }
 }

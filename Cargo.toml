@@ -15,6 +15,9 @@ serde_json = "1"
 # cancellation channel (sync).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "time", "sync"] }
 ureq = { version = "2.12", features = ["json"] }
+# ReceiverStream/BroadcastStream: wrap the live run event channels as
+# Streams for axum's SSE response body ("sync" enables the broadcast one).
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

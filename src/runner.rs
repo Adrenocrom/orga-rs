@@ -19,35 +19,122 @@
 //! Each run is recorded in the `runs` table: `queued` while waiting for the
 //! slot, `running` while the process is alive, then `completed` (exit 0),
 //! `failed` (non-zero exit or spawn error), `timed_out` (killed after the
-//! configured timeout) or `cancelled` (killed via [`RunRegistry::cancel`]).
+//! configured timeout, when one is set) or `cancelled` (killed via
+//! [`RunRegistry::cancel`]).
 //! Output (stdout + stderr) is captured up to [`MAX_RUN_OUTPUT_BYTES`],
 //! keeping the tail — the interesting part of a log is usually the end.
+//!
+//! Every prompt is terminated with the [`END_OF_INPUT_MARKER`] line so
+//! agents can detect the end of the task text without waiting for stdin
+//! EOF (the runner closes stdin right after, so EOF still follows).
+//!
+//! **Live streaming:** while a run is live, its "conversation" — the prompt
+//! the agent received plus every chunk of stdout/stderr as it is produced —
+//! is available through [`stream_events`], which the web layer exposes as
+//! Server-Sent Events. Late subscribers are caught up from a replay buffer
+//! (tail-capped like the stored output) before the live chunks follow.
 //!
 //! Runs do not survive a server restart as processes: at startup,
 //! [`fail_orphaned_runs`] flips still-`running` rows to `failed` and
 //! re-queues nothing (a queued run's task may have changed since).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::db::{Db, SharedDb};
 use crate::models::{
-    render_prompt, Agent, Run, RunStatus, Task, DEFAULT_RUN_TIMEOUT_SECS, MAX_RUN_OUTPUT_BYTES,
+    render_prompt, Agent, Run, RunStatus, Task, MAX_RUN_OUTPUT_BYTES,
 };
+
+/// Marker appended to every prompt so the agent can tell where the task
+/// text ends — useful for agents that read stdin without waiting for EOF.
+const END_OF_INPUT_MARKER: &str = "###END_OF_INPUT###";
 
 /// The registry shared through the router state.
 pub type SharedRegistry = std::sync::Arc<RunRegistry>;
 
-/// Live runs by id: the cancel channel of each supervisor task. Entries are
+/// One event of a live run's conversation, as sent to SSE subscribers.
+#[derive(Debug, Clone)]
+pub enum RunEvent {
+    /// The prompt the agent received on stdin (replayed to late joiners).
+    Prompt(String),
+    /// A chunk of the agent's stdout/stderr, in arrival order.
+    Output(String),
+    /// A lifecycle note: "queued", "running", "completed", …
+    Status(String),
+    /// The conversation is over (the run reached a final status).
+    End,
+}
+
+/// Live conversation state of one run: a replay buffer (so a subscriber
+/// that joins mid-run sees what happened so far) plus a broadcast channel
+/// for the chunks still to come. The buffer is capped like the stored
+/// output — the interesting part of a log is usually the end.
+pub struct RunStream {
+    /// Sequence numbers of the events sent so far; the first event of a
+    /// replayed batch carries this number so the client can dedupe.
+    seq: AtomicU64,
+    buffer: Mutex<Vec<(u64, RunEvent)>>,
+    tx: broadcast::Sender<RunEvent>,
+}
+
+impl RunStream {
+    fn new() -> Self {
+        let (tx, _) = broadcast::channel(64);
+        Self {
+            seq: AtomicU64::new(0),
+            buffer: Mutex::new(Vec::new()),
+            tx,
+        }
+    }
+
+    /// Record an event: append it to the replay buffer (dropping the head
+    /// when it exceeds the cap) and broadcast it to live subscribers.
+    fn push(&self, event: RunEvent) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut buffer) = self.buffer.lock() {
+            buffer.push((seq, event.clone()));
+            let mut total = buffer.iter().map(|(_, e)| event_len(e)).sum::<usize>();
+            while total > MAX_RUN_OUTPUT_BYTES && buffer.len() > 1 {
+                let (_, dropped) = buffer.remove(0);
+                total -= event_len(&dropped);
+            }
+        }
+        let _ = self.tx.send(event); // no subscribers is fine
+    }
+
+    /// Everything recorded so far, oldest first.
+    fn replay(&self) -> Vec<(u64, RunEvent)> {
+        self.buffer.lock().map(|b| b.clone()).unwrap_or_default()
+    }
+
+    /// A receiver for the events still to come.
+    fn subscribe(&self) -> broadcast::Receiver<RunEvent> {
+        self.tx.subscribe()
+    }
+}
+
+/// Rough size of an event for the replay-buffer cap.
+fn event_len(event: &RunEvent) -> usize {
+    match event {
+        RunEvent::Prompt(s) | RunEvent::Output(s) | RunEvent::Status(s) => s.len(),
+        RunEvent::End => 0,
+    }
+}
+
+/// Live runs by id: the cancel channel of each supervisor task, plus the
+/// conversation stream of runs that are queued or running. Entries are
 /// added by [`start`] and removed by the supervisor when the run ends, so a
 /// missing entry means "no live process for this run".
 #[derive(Default)]
 pub struct RunRegistry {
     senders: Mutex<HashMap<i64, mpsc::Sender<()>>>,
+    streams: Mutex<HashMap<i64, std::sync::Arc<RunStream>>>,
 }
 
 impl RunRegistry {
@@ -74,6 +161,35 @@ impl RunRegistry {
 
     fn remove(&self, run_id: i64) {
         if let Ok(mut map) = self.senders.lock() {
+            map.remove(&run_id);
+        }
+    }
+
+    /// The conversation stream of a run that is queued or running, if it
+    /// is live in this server process.
+    pub fn stream(&self, run_id: i64) -> Option<std::sync::Arc<RunStream>> {
+        self.streams.lock().ok().and_then(|m| m.get(&run_id).cloned())
+    }
+
+    /// Everything recorded so far for a live run, plus a receiver for the
+    /// events still to come. The web layer uses this to serve SSE: replay
+    /// first, then live events. `None` when the run is not live (it either
+    /// finished — its stored output is served instead — or never existed).
+    pub fn subscribe(&self, run_id: i64) -> Option<(Vec<(u64, RunEvent)>, broadcast::Receiver<RunEvent>)> {
+        let stream = self.stream(run_id)?;
+        Some((stream.replay(), stream.subscribe()))
+    }
+
+    /// Register the stream of a run that is about to be queued or spawned.
+    /// The supervisor removes it when the run reaches a final status.
+    fn insert_stream(&self, run_id: i64, stream: std::sync::Arc<RunStream>) {
+        if let Ok(mut map) = self.streams.lock() {
+            map.insert(run_id, stream);
+        }
+    }
+
+    fn remove_stream(&self, run_id: i64) {
+        if let Ok(mut map) = self.streams.lock() {
             map.remove(&run_id);
         }
     }
@@ -136,14 +252,27 @@ pub async fn start(
             .map_err(|e| format!("database error: {e}"))?
     };
 
-    // 2. A queued run has no process; the supervisor of the current run will
-    //    pick it up when the slot frees.
+    // 2. The conversation stream exists from the moment the run row does,
+    //    so a subscriber can attach to a queued run and watch it start.
+    //    A queued run has no process; the supervisor of the current run
+    //    picks it up when the slot frees.
+    let stream = std::sync::Arc::new(RunStream::new());
+    registry.insert_stream(run.id, stream.clone());
     if run.status == RunStatus::Queued.as_str() {
+        stream.push(RunEvent::Status("queued".to_string()));
         return Ok(run);
     }
 
-    spawn_and_supervise(db, registry, slots, run.id, task, agent).await?;
+    spawn_and_supervise(db, registry, slots, run.id, task, agent, stream).await?;
     Ok(run)
+}
+
+/// The effective timeout of a run: `Some(secs)` arms a timer, `None` means
+/// the run has no timeout at all (it ends only by exit or cancellation).
+/// A configured 0 counts as "no timeout" — the same value the dashboard
+/// sends for an explicitly empty field.
+fn resolve_timeout(configured: Option<u64>) -> Option<u64> {
+    configured.filter(|t| *t > 0)
 }
 
 /// Spawn the process for a run and start its supervisor. Used both for
@@ -155,12 +284,26 @@ async fn spawn_and_supervise(
     run_id: i64,
     task: Task,
     agent: Agent,
+    stream: std::sync::Arc<RunStream>,
 ) -> Result<(), String> {
     let prompt = render_prompt(agent.prompt_template.as_deref(), &task);
-    let timeout_secs = agent
-        .timeout_secs
-        .filter(|t| *t > 0)
-        .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
+    // Append the end-of-input marker unless the rendered prompt already
+    // ends with it (a template may include it deliberately). Either way
+    // the prompt ends with a newline so the marker is a line of its own.
+    let prompt = if prompt.trim_end().ends_with(END_OF_INPUT_MARKER) {
+        format!("{}\n", prompt.trim_end())
+    } else {
+        format!("{prompt}\n{END_OF_INPUT_MARKER}\n")
+    };
+    // The timeout is optional: absent (or 0) means the process is only
+    // ended by its own exit or a cancellation — no timer is armed.
+    let timeout_secs = resolve_timeout(agent.timeout_secs);
+    // The conversation opens with the run starting and the prompt the
+    // agent received — a subscriber sees what the agent was asked to do
+    // before its output arrives. (Emitted here rather than in `supervise`
+    // so a queued run's pickup does not duplicate it.)
+    stream.push(RunEvent::Status("running".to_string()));
+    stream.push(RunEvent::Prompt(prompt.clone()));
 
     // The task's workdir is where the agent executes. It must exist at
     // spawn time; a missing directory is a failed run, not a spawn in the
@@ -182,6 +325,9 @@ async fn spawn_and_supervise(
             // The run row already exists; do not leave it dangling as
             // "running" forever, and free the slot for the next queued run.
             mark_failed(&db, run_id, &format!("cannot spawn command: {e}"));
+            stream.push(RunEvent::Status("failed".to_string()));
+            stream.push(RunEvent::End);
+            registry.remove_stream(run_id);
             release_and_pull_next(db.clone(), registry, slots, agent.id);
             return Err(format!("cannot spawn command: {e}"));
         }
@@ -211,6 +357,7 @@ async fn spawn_and_supervise(
         cancel_rx,
         timeout_secs,
         agent.id,
+        stream,
     ));
 
     Ok(())
@@ -245,9 +392,16 @@ fn release_and_pull_next(
     };
     let Some(run) = next else { return };
     // Re-read the task (it may have changed while queued) and the agent
-    // (its command may have been edited), then spawn.
-    let (task, agent) = {
+    // (its command may have been edited), then spawn. The run row is
+    // re-checked as well: it may have been cancelled or deleted after the
+    // flip to `running` but before this spawn (the flip and the spawn are
+    // not one atomic step) — such a run must not start.
+    let (task, agent, stream) = {
         let Ok(guard) = db.lock() else { return };
+        match guard.get_run(run.id) {
+            Ok(Some(r)) if r.status == "running" => {}
+            _ => return, // deleted or no longer running — do not spawn
+        }
         let task = match guard.get(run.task_id) {
             Ok(Some(t)) => t,
             _ => return,
@@ -256,7 +410,13 @@ fn release_and_pull_next(
             Ok(Some(a)) => a,
             _ => return,
         };
-        (task, agent)
+        // The stream was registered when the run was created; it is still
+        // there because the run is still live (checked above).
+        let stream = match registry.stream(run.id) {
+            Some(s) => s,
+            None => return,
+        };
+        (task, agent, stream)
     };
     // The slot was released above; re-acquire it for this run. It cannot be
     // taken: only this code path starts runs for a freed slot, and it runs
@@ -275,7 +435,7 @@ fn release_and_pull_next(
         return;
     }
     tokio::spawn(async move {
-        if let Err(e) = spawn_and_supervise(db, registry, slots, run.id, task, agent).await {
+        if let Err(e) = spawn_and_supervise(db, registry, slots, run.id, task, agent, stream).await {
             eprintln!("cannot start queued run {}: {e}", run.id);
         }
     });
@@ -283,7 +443,9 @@ fn release_and_pull_next(
 
 /// Supervise one run: wait for exit, timeout or cancellation, then persist
 /// the outcome, drop the registry entry and release the agent's slot
-/// (starting the next queued run, if any).
+/// (starting the next queued run, if any). `timeout_secs` is `None` when
+/// the agent has no timeout configured — the run then ends only by exit or
+/// cancellation.
 async fn supervise(
     db: SharedDb,
     registry: SharedRegistry,
@@ -291,26 +453,36 @@ async fn supervise(
     run_id: i64,
     mut child: tokio::process::Child,
     mut cancel: mpsc::Receiver<()>,
-    timeout_secs: u64,
+    timeout_secs: Option<u64>,
     agent_id: i64,
+    stream: std::sync::Arc<RunStream>,
 ) {
     // Read both streams to EOF in the background, keeping only the tail so a
-    // chatty process can never block on a full pipe.
+    // chatty process can never block on a full pipe. Every chunk is also
+    // pushed into the live stream as it arrives.
     let mut stdout = child.stdout.take().expect("stdout was piped");
     let mut stderr = child.stderr.take().expect("stderr was piped");
+    let stream_for_io = stream.clone();
     let out_task = tokio::spawn(async move {
-        let a = read_tail(&mut stdout).await;
-        let b = read_tail(&mut stderr).await;
+        let a = read_tail(&mut stdout, Some(&stream_for_io)).await;
+        let b = read_tail(&mut stderr, Some(&stream_for_io)).await;
         (a, b)
     });
 
-    // Wait for the process, the timeout or a cancellation request.
+    // Wait for the process, the timeout (when one is configured) or a
+    // cancellation request. Without a timeout the timer arm never fires:
+    // `pending()` is a future that never resolves.
     let outcome = tokio::select! {
         status = child.wait() => match status {
             Ok(status) => Outcome::Exited(status),
             Err(_) => Outcome::SpawnError,
         },
-        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => Outcome::TimedOut,
+        _ = async {
+            match timeout_secs {
+                Some(secs) => tokio::time::sleep(std::time::Duration::from_secs(secs)).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => Outcome::TimedOut,
         _ = cancel.recv() => Outcome::Cancelled,
     };
 
@@ -354,6 +526,12 @@ async fn supervise(
         let _ = guard.finish_run(run_id, status, exit_code, &output);
     }
 
+    // The conversation is over: tell the subscribers, then stop serving
+    // the stream (a late subscriber falls back to the stored output).
+    stream.push(RunEvent::Status(status.as_str().to_string()));
+    stream.push(RunEvent::End);
+    registry.remove_stream(run_id);
+
     // The slot frees with the run; hand it to the next queued run.
     release_and_pull_next(db, registry, slots, agent_id);
 }
@@ -366,13 +544,24 @@ enum Outcome {
 }
 
 /// Read a stream to EOF, keeping only the last [`MAX_RUN_OUTPUT_BYTES`].
-async fn read_tail(r: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
+/// When a live stream is given, every chunk is also pushed to it as it
+/// arrives (lossy-converted to a string — the stored tail keeps the exact
+/// bytes; the live view is for humans watching).
+async fn read_tail(
+    r: &mut (impl tokio::io::AsyncRead + Unpin),
+    stream: Option<&std::sync::Arc<RunStream>>,
+) -> Vec<u8> {
     let mut tail: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         match r.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                if let Some(stream) = stream {
+                    stream.push(RunEvent::Output(
+                        String::from_utf8_lossy(&chunk[..n]).into_owned(),
+                    ));
+                }
                 tail.extend_from_slice(&chunk[..n]);
                 if tail.len() > MAX_RUN_OUTPUT_BYTES {
                     let drop = tail.len() - MAX_RUN_OUTPUT_BYTES;
@@ -439,7 +628,7 @@ mod tests {
         let mut data = vec![b'a'; MAX_RUN_OUTPUT_BYTES + 100];
         data.extend_from_slice(b"THE-END");
         let mut cursor = std::io::Cursor::new(data);
-        let tail = read_tail(&mut cursor).await;
+        let tail = read_tail(&mut cursor, None).await;
         assert_eq!(tail.len(), MAX_RUN_OUTPUT_BYTES);
         assert!(tail.ends_with(b"THE-END"));
     }
@@ -535,7 +724,35 @@ mod tests {
             .unwrap();
         let finished = wait_for(&db, run.id, "running").await;
         assert_eq!(finished.status, "completed");
-        assert_eq!(finished.output, "PROMPT say hi");
+        assert_eq!(finished.output, "PROMPT say hi\n###END_OF_INPUT###\n");
+    }
+
+    #[tokio::test]
+    async fn the_end_of_input_marker_is_appended_to_every_prompt() {
+        let (db, registry, slots) = setup();
+        // `cat` echoes stdin verbatim, so the output shows exactly what the
+        // agent received: the rendered prompt followed by the marker.
+        let (task, agent) = seed(&db, "cat", None, Some(5));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+        let finished = wait_for(&db, run.id, "running").await;
+        assert_eq!(finished.status, "completed");
+        assert!(finished.output.ends_with("###END_OF_INPUT###\n"), "output: {}", finished.output);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_already_ends_with_the_marker_is_not_duplicated() {
+        let (db, registry, slots) = setup();
+        let (task, agent) = seed(&db, "cat", Some("do it\n###END_OF_INPUT###"), Some(5));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+        let finished = wait_for(&db, run.id, "running").await;
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.output, "do it\n###END_OF_INPUT###\n");
     }
 
     #[tokio::test]
@@ -562,6 +779,47 @@ mod tests {
             .unwrap();
         let finished = wait_for(&db, run.id, "running").await;
         assert_eq!(finished.status, "timed_out");
+    }
+
+    #[tokio::test]
+    async fn timeout_zero_means_no_timer_at_all() {
+        let (db, registry, slots) = setup();
+        // A command that finishes on its own after a moment: with a 1 s
+        // timer it would be killed (timed_out), with no timer it completes.
+        // (The old semantics — 0 -> 600 s default — would also let this
+        // pass, so the resolution matrix is pinned separately below.)
+        let (task, agent) = seed(&db, "sleep 2; echo done", None, Some(0));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+        let finished = wait_for(&db, run.id, "running").await;
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.exit_code, Some(0));
+        assert!(finished.output.contains("done"));
+    }
+
+    #[test]
+    fn timeout_resolution_absent_and_zero_mean_no_timer() {
+        // The timeout is optional: absent (None) and an explicit 0 both
+        // mean "no timeout"; only a positive value arms a timer.
+        assert_eq!(resolve_timeout(None), None);
+        assert_eq!(resolve_timeout(Some(0)), None);
+        assert_eq!(resolve_timeout(Some(1)), Some(1));
+        assert_eq!(resolve_timeout(Some(600)), Some(600));
+    }
+
+    #[tokio::test]
+    async fn a_run_without_timeout_can_still_be_cancelled() {
+        let (db, registry, slots) = setup();
+        let (task, agent) = seed(&db, "sleep 60", None, Some(0));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+        assert!(registry.cancel(run.id));
+        let finished = wait_for(&db, run.id, "running").await;
+        assert_eq!(finished.status, "cancelled");
     }
 
     #[tokio::test]
@@ -709,5 +967,205 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "failed");
         assert!(runs[0].output.contains("cannot spawn command"));
+    }
+
+    // ---------- live conversation streaming ----------
+
+    /// Collect the events of a live run's stream until it ends (or the
+    /// poll budget runs out), then return them.
+    async fn collect_stream(registry: &SharedRegistry, run_id: i64) -> Vec<RunEvent> {
+        let (replay, mut live) = registry.subscribe(run_id).expect("run is live");
+        let mut events: Vec<RunEvent> = replay.into_iter().map(|(_, e)| e).collect();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), live.recv()).await {
+                Ok(Ok(event)) => {
+                    let over = matches!(event, RunEvent::End);
+                    events.push(event);
+                    if over {
+                        return events;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                    events.push(RunEvent::Status("lagged".into()));
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return events,
+                Err(_) => return events, // poll budget exhausted
+            }
+        }
+    }
+
+    /// The event kinds in order, for compact assertions. Status events are
+    /// shown by their status string (queued/running/completed/…).
+    fn kinds(events: &[RunEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                RunEvent::Prompt(_) => "prompt".to_string(),
+                RunEvent::Output(_) => "output".to_string(),
+                RunEvent::Status(s) => s.clone(),
+                RunEvent::End => "end".to_string(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_running_run_streams_prompt_output_and_end() {
+        let (db, registry, slots) = setup();
+        let (task, agent) = seed(&db, "cat", Some("hello {title}"), Some(5));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+
+        let events = collect_stream(&registry, run.id).await;
+        assert_eq!(
+            kinds(&events),
+            vec![
+                "running".to_string(),
+                "prompt".to_string(),
+                "output".to_string(),
+                "completed".to_string(),
+                "end".to_string()
+            ]
+        );
+        // The prompt is exactly what the agent received on stdin.
+        assert!(matches!(&events[1], RunEvent::Prompt(p) if p.contains("hello say hi")));
+        // The output chunk carries the agent's stdout.
+        assert!(matches!(&events[2], RunEvent::Output(o) if o.contains("hello say hi")));
+    }
+
+    #[tokio::test]
+    async fn a_late_subscriber_sees_the_replay_then_the_rest() {
+        let (db, registry, slots) = setup();
+        // A slow command keeps the run alive while the subscriber attaches.
+        let (task, agent) = seed(&db, "echo first; sleep 0.4; echo second", None, Some(10));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+        // Wait for the first output chunk to exist, then subscribe — the
+        // replay must contain it.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let events = collect_stream(&registry, run.id).await;
+        let joined: String = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::Output(o) => Some(o.as_str()),
+                _ => None,
+            })
+            .collect();
+        // The replayed "first" is not lost, and "second" arrives live.
+        assert!(joined.contains("first"), "joined: {joined}");
+        assert!(joined.contains("second"), "joined: {joined}");
+        assert!(events.iter().any(|e| matches!(e, RunEvent::End)));
+    }
+
+    #[tokio::test]
+    async fn a_queued_run_streams_from_queued_to_end() {
+        let (db, registry, slots) = setup();
+        // Hold the slot with a long sleep; the second run queues.
+        let (task, agent) = seed(&db, "sleep 30", None, Some(60));
+        let first = start(db.clone(), registry.clone(), slots.clone(), task.clone(), agent.clone())
+            .await
+            .unwrap();
+        let second = start(db.clone(), registry.clone(), slots.clone(), task.clone(), agent.clone())
+            .await
+            .unwrap();
+        assert_eq!(second.status, "queued");
+
+        // Make the queued run fast (it re-reads the config at pickup).
+        {
+            let mut guard = db.lock().unwrap();
+            guard
+                .update_agent(
+                    agent.id,
+                    &crate::models::UpdateAgent {
+                        name: None,
+                        command: Some("true".into()),
+                        prompt_template: None,
+                        timeout_secs: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        // The queued run's stream opens with the queued note.
+        let (replay, mut live) = registry.subscribe(second.id).expect("queued run is live");
+        assert!(replay
+            .iter()
+            .any(|(_, e)| matches!(e, RunEvent::Status(s) if s == "queued")));
+
+        // Free the slot; the queued run starts and its stream follows.
+        assert!(registry.cancel(first.id));
+        let mut events: Vec<RunEvent> = replay.into_iter().map(|(_, e)| e).collect();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), live.recv()).await {
+                Ok(Ok(event)) => {
+                    let over = matches!(event, RunEvent::End);
+                    events.push(event);
+                    if over {
+                        break;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                _ => panic!("queued run's stream did not end in time"),
+            }
+        }
+        assert_eq!(
+            kinds(&events),
+            vec![
+                "queued".to_string(),
+                "running".to_string(),
+                "prompt".to_string(),
+                "completed".to_string(),
+                "end".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stream_ends_when_the_run_is_cancelled() {
+        let (db, registry, slots) = setup();
+        let (task, agent) = seed(&db, "sleep 60", None, Some(60));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+        assert!(registry.cancel(run.id));
+
+        let events = collect_stream(&registry, run.id).await;
+        assert!(events.iter().any(|e| matches!(e, RunEvent::Status(s) if s == "cancelled")));
+        assert!(events.iter().any(|e| matches!(e, RunEvent::End)));
+        // The stream is gone once the run ended.
+        assert!(registry.subscribe(run.id).is_none());
+    }
+
+    #[test]
+    fn the_replay_buffer_keeps_only_the_tail() {
+        // The replay buffer is capped like the stored output: a late
+        // subscriber sees the last ~64 KiB, not the whole conversation.
+        let stream = RunStream::new();
+        stream.push(RunEvent::Status("running".into()));
+        // ~200 bytes per chunk × 1000 chunks ≈ 200 KB, well over the cap.
+        for i in 0..1000 {
+            stream.push(RunEvent::Output(format!(
+                "chunk {i} {}",
+                "x".repeat(200)
+            )));
+        }
+        let replay = stream.replay();
+        let total: usize = replay.iter().map(|(_, e)| event_len(e)).sum();
+        assert!(total <= MAX_RUN_OUTPUT_BYTES + 1024, "total: {total}");
+        // The oldest chunks were dropped; the newest are all there.
+        let texts: Vec<&str> = replay
+            .iter()
+            .filter_map(|(_, e)| match e {
+                RunEvent::Output(o) => Some(o.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!texts.iter().any(|t| t.contains("chunk 0 ")), "the head was dropped");
+        assert!(texts.iter().any(|t| t.contains("chunk 999 ")), "the tail is kept");
     }
 }

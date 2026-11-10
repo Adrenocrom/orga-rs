@@ -16,26 +16,47 @@
     margin: 0; background: var(--bg); color: var(--text);
     font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
-  header { padding: 24px 24px 0; }
-  h1 { margin: 0 0 16px; font-size: 22px; letter-spacing: .5px; }
+
+  /* ---- slim header: title · stat pills · add · filters · count, one line ---- */
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 8px 24px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  h1 { margin: 0; font-size: 16px; letter-spacing: .5px; white-space: nowrap; }
   h1 span { color: var(--accent); }
-
-  .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .stats { display: flex; gap: 6px; flex-wrap: wrap; }
   .stat {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    padding: 10px 18px; min-width: 110px;
+    display: inline-flex; align-items: baseline; gap: 5px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 999px;
+    padding: 1px 10px; white-space: nowrap;
   }
-  .stat b { display: block; font-size: 22px; }
-  .stat small { color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .5px; }
-  .stat.alert b { color: var(--danger); }
+  .stat b { font-size: 13px; }
+  .stat small {
+    color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: .5px;
+  }
+  .stat.alert b, .stat.alert small { color: var(--danger); }
+  header label {
+    color: var(--muted); font-size: 12px;
+    display: inline-flex; gap: 6px; align-items: center;
+  }
+  header select { padding: 3px 6px; font-size: 13px; }
+  header .primary { padding: 4px 12px; font-size: 13px; }
+  header .count { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
 
-  main { padding: 0 24px 40px; max-width: 900px; margin: 0 auto; }
-  form, .toolbar, .task {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  main { padding: 16px 24px 40px; max-width: 1400px; margin: 0 auto; }
+
+  /* ---- two panes: task list on the left, detail on the right ---- */
+  .layout {
+    display: grid; gap: 16px; align-items: start;
+    grid-template-columns: minmax(280px, 2fr) minmax(340px, 3fr);
   }
-  form { padding: 16px; display: grid; gap: 10px; margin-bottom: 16px; }
-  form .row { display: flex; gap: 10px; flex-wrap: wrap; }
-  form .row > * { flex: 1; min-width: 130px; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  /* Each pane scrolls on its own, so a long list never pushes the detail
+     pane out of view (and vice versa). */
+  .pane-scroll, .detail { max-height: calc(100vh - 110px); overflow-y: auto; }
+
   input, select, textarea, button {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 8px; padding: 8px 10px; font: inherit;
@@ -45,11 +66,68 @@
   button { cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   button.primary:hover { filter: brightness(1.1); }
+  button.primary:disabled { opacity: .45; cursor: not-allowed; }
   button.ghost { background: transparent; }
   button.ghost:hover { border-color: var(--muted); }
   button.danger { background: transparent; color: var(--danger); border-color: transparent; }
   button.danger:hover { border-color: var(--danger); }
-  .form-actions { display: flex; gap: 10px; }
+
+  /* ---- task list (left pane) ---- */
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  .task {
+    display: block; width: 100%; text-align: left;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; font: inherit; color: inherit;
+  }
+  .task:hover { border-color: var(--muted); }
+  .task:focus-visible { outline: 1px solid var(--accent); }
+  .task.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .task .row1 { display: flex; gap: 8px; align-items: baseline; }
+  .task .title { font-weight: 600; overflow-wrap: anywhere; }
+  .task .sub { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
+  .task.done .title { text-decoration: line-through; color: var(--muted); }
+  .id {
+    color: var(--muted); flex-shrink: 0;
+    font: 12px/1.5 ui-monospace, "Cascadia Code", monospace;
+  }
+
+  .badge {
+    border-radius: 999px; padding: 1px 8px; font-size: 11px; font-weight: 600;
+    border: 1px solid var(--border); color: var(--muted); background: var(--bg);
+    white-space: nowrap;
+  }
+  .badge.status-todo { color: var(--todo); }
+  .badge.status-in_progress { color: var(--progress); border-color: var(--progress); }
+  .badge.status-done { color: var(--done); border-color: var(--done); }
+  .badge.prio-high { color: var(--danger); border-color: var(--danger); }
+  .badge.prio-medium { color: var(--progress); }
+  .badge.due { color: var(--muted); }
+  .badge.due.overdue { color: var(--danger); border-color: var(--danger); }
+  .badge.agent { color: var(--accent); border-color: var(--accent); }
+  .badge.run-queued { color: var(--muted); border-color: var(--muted); }
+  .badge.run-running { color: var(--progress); border-color: var(--progress); }
+  .badge.run-completed { color: var(--done); border-color: var(--done); }
+  .badge.run-failed, .badge.run-timed_out, .badge.run-cancelled {
+    color: var(--danger); border-color: var(--danger);
+  }
+
+  /* ---- detail pane (right) ---- */
+  .detail {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px 20px; min-height: 320px;
+  }
+  .detail .head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .detail h2 { margin: 0; font-size: 18px; overflow-wrap: anywhere; flex: 1; min-width: 200px; }
+  .detail .desc { white-space: pre-wrap; overflow-wrap: anywhere; margin: 14px 0; }
+  .detail .desc.empty { color: var(--muted); font-style: italic; }
+  .detail .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+  .detail .meta button.badge { padding: 3px 10px; font-size: 12px; }
+  .detail .actions {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px;
+  }
+  .detail .actions select { padding: 6px 8px; font-size: 13px; max-width: 220px; }
+  .detail .times { color: var(--muted); font-size: 12px; margin: 14px 0 0; }
+  .detail .placeholder { color: var(--muted); text-align: center; padding: 60px 0; }
 
   /* add/edit task dialog (native <dialog>, opened via showModal) */
   dialog {
@@ -62,42 +140,16 @@
   dialog form { background: none; border: none; padding: 0; margin: 0; }
   dialog h2 { margin: 0; font-size: 17px; }
 
-  .toolbar {
-    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
-    padding: 10px 16px; margin-bottom: 12px;
+  form {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; display: grid; gap: 10px; margin-bottom: 16px;
   }
-  .toolbar label { color: var(--muted); font-size: 13px; }
-  .toolbar .count { margin-left: auto; color: var(--muted); font-size: 13px; }
-
-  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
-  .task { padding: 14px 16px; display: flex; gap: 14px; align-items: flex-start; }
-  .task .body { flex: 1; min-width: 0; }
-  .task .title { font-weight: 600; margin: 0 0 2px; overflow-wrap: anywhere; }
-  .task .desc { color: var(--muted); margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .task .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12px; }
-  .badge {
-    border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600;
-    border: 1px solid var(--border); color: var(--muted); background: var(--bg);
-  }
-  .badge.status-todo { color: var(--todo); }
-  .badge.status-in_progress { color: var(--progress); border-color: var(--progress); }
-  .badge.status-done { color: var(--done); border-color: var(--done); }
-  .badge.prio-high { color: var(--danger); border-color: var(--danger); }
-  .badge.prio-medium { color: var(--progress); }
-  .badge.due { color: var(--muted); }
-  .badge.due.overdue { color: var(--danger); border-color: var(--danger); }
-  .task .actions { display: flex; gap: 6px; flex-wrap: wrap; }
-  .task.done .title { text-decoration: line-through; color: var(--muted); }
-  .badge.agent { color: var(--accent); border-color: var(--accent); }
-  .badge.run-queued { color: var(--muted); border-color: var(--muted); }
-  .badge.run-running { color: var(--progress); border-color: var(--progress); }
-  .badge.run-completed { color: var(--done); border-color: var(--done); }
-  .badge.run-failed, .badge.run-timed_out, .badge.run-cancelled {
-    color: var(--danger); border-color: var(--danger);
-  }
+  form .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  form .row > * { flex: 1; min-width: 130px; }
+  .form-actions { display: flex; gap: 10px; }
 
   /* agent config mask */
-  details { margin-bottom: 16px; }
+  details { margin: 24px 0 16px; }
   details > summary {
     cursor: pointer; color: var(--muted); font-size: 13px;
     padding: 8px 2px; user-select: none;
@@ -134,6 +186,22 @@
   }
   .run .times { color: var(--muted); font-size: 12px; }
 
+  /* live conversation dialog */
+  #stream-dialog { width: min(860px, calc(100vw - 48px)); }
+  #stream-dialog h2 { margin: 0 0 4px; font-size: 17px; }
+  #stream-dialog .sub { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  #stream-log {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; margin: 0 0 12px; font: 12px/1.55 ui-monospace, "Cascadia Code", monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    height: min(60vh, 520px); overflow-y: auto;
+  }
+  #stream-log .prompt { color: var(--accent); }
+  #stream-log .note { color: var(--muted); }
+  #stream-log .resync { color: var(--danger); }
+  #stream-log .end { color: var(--done); }
+  #stream-dialog .form-actions { justify-content: flex-end; }
+
   #empty { color: var(--muted); text-align: center; padding: 30px; }
   #toast {
     position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
@@ -144,15 +212,41 @@
 </head>
 <body>
 <header>
-  <h1>orga<span>-rs</span> · task manager</h1>
+  <h1>orga<span>-rs</span></h1>
   <div class="stats" id="stats"></div>
+  <button class="primary" id="open-add">+ Add task</button>
+  <label>Status
+    <select id="filter-status">
+      <option value="">all</option>
+      <option value="todo">todo</option>
+      <option value="in_progress">in_progress</option>
+      <option value="done">done</option>
+    </select>
+  </label>
+  <label>Priority
+    <select id="filter-priority">
+      <option value="">all</option>
+      <option value="low">low</option>
+      <option value="medium">medium</option>
+      <option value="high">high</option>
+    </select>
+  </label>
+  <span class="count" id="count"></span>
 </header>
 <main>
+  <div class="layout">
+    <div class="pane-scroll">
+      <ul id="list"></ul>
+      <p id="empty" hidden>No tasks match the current filters.</p>
+    </div>
+    <section class="detail" id="detail" aria-live="polite"></section>
+  </div>
+
   <dialog id="task-dialog" aria-labelledby="dialog-title">
     <form id="form" autocomplete="off">
       <h2 id="dialog-title">Add task</h2>
       <input id="title" placeholder="Task title" required maxlength="200">
-      <textarea id="description" placeholder="Description (optional)" rows="2"></textarea>
+      <textarea id="description" placeholder="Description (optional)" rows="6"></textarea>
       <div class="row">
         <select id="status">
           <option value="todo">todo</option>
@@ -174,39 +268,14 @@
     </form>
   </dialog>
 
-  <div class="toolbar">
-    <button class="primary" id="open-add">+ Add task</button>
-    <label>Status
-      <select id="filter-status">
-        <option value="">all</option>
-        <option value="todo">todo</option>
-        <option value="in_progress">in_progress</option>
-        <option value="done">done</option>
-      </select>
-    </label>
-    <label>Priority
-      <select id="filter-priority">
-        <option value="">all</option>
-        <option value="low">low</option>
-        <option value="medium">medium</option>
-        <option value="high">high</option>
-      </select>
-    </label>
-    <span class="count" id="count"></span>
-  </div>
-
-  <ul id="list"></ul>
-  <p id="empty" hidden>No tasks match the current filters.</p>
-
   <details id="agents-section">
     <summary>Agents — configure commands that can work on tasks</summary>
-
     <form id="agent-form" autocomplete="off">
       <input id="agent-name" placeholder="Agent name (e.g. coder)" required maxlength="100">
       <input id="agent-command" placeholder="Command (e.g. my-agent --model x)" required maxlength="2000">
-      <textarea id="agent-prompt" placeholder="Prompt template (optional) — placeholders: {id} {title} {description} {status} {priority} {due_date}" rows="2" maxlength="2000"></textarea>
+      <textarea id="agent-prompt" placeholder="Prompt template (optional) — placeholders: {id} {title} {description} {status} {priority} {due_date}" rows="4" maxlength="2000"></textarea>
       <div class="row">
-        <input id="agent-timeout" type="number" min="0" max="86400" placeholder="Timeout seconds (0 = default 600)">
+        <input id="agent-timeout" type="number" min="0" max="86400" placeholder="Timeout seconds (optional, 0 = none)">
       </div>
       <div class="form-actions">
         <button class="primary" id="agent-submit" type="submit">Add agent</button>
@@ -225,6 +294,15 @@
     <p id="runs-empty" hidden>No agent runs yet.</p>
   </section>
 </main>
+
+<dialog id="stream-dialog" aria-labelledby="stream-title">
+  <h2 id="stream-title">Live conversation</h2>
+  <p class="sub" id="stream-sub"></p>
+  <pre id="stream-log" aria-live="polite"></pre>
+  <div class="form-actions">
+    <button class="ghost" id="stream-close" type="button">Close</button>
+  </div>
+</dialog>
 <div id="toast" hidden></div>
 
 <script>
@@ -233,10 +311,12 @@
 const $ = (sel) => document.querySelector(sel);
 const state = {
   status: '', priority: '', editing: null,
-  agents: [],            // configured agents (id, name, command, ...)
-  agentEditing: null,     // agent id being edited in the config mask
-  runs: [],              // recent runs
-  pollTimer: null,        // runs polling while any run is live
+  selected: null,          // id of the task shown in the detail pane
+  tasks: [],                // tasks matching the current filters
+  agents: [],               // configured agents (id, name, command, ...)
+  agentEditing: null,       // agent id being edited in the config mask
+  runs: [],                 // recent runs
+  pollTimer: null,          // runs polling while any run is live
 };
 
 // Escape user content before it goes into innerHTML.
@@ -284,10 +364,12 @@ async function load() {
       api('/api/runs?limit=50'),
     ]);
     renderStats(stats);
-    renderList(tasks);
+    state.tasks = tasks;
     state.agents = agents;
-    renderAgents();
     state.runs = runs;
+    renderList();
+    renderDetail();
+    renderAgents();
     renderRuns();
     schedulePolling();
   } catch (err) {
@@ -317,7 +399,9 @@ async function refreshRuns() {
     const params = new URLSearchParams();
     if (state.status) params.set('status', state.status);
     if (state.priority) params.set('priority', state.priority);
-    renderList(await api('/api/tasks?' + params.toString()));
+    state.tasks = await api('/api/tasks?' + params.toString());
+    renderList();
+    renderDetail();
   } catch (err) {
     toast(err.message);
   }
@@ -331,56 +415,105 @@ function renderStats(stats) {
     ['done', 'Done', false],
     ['overdue', 'Overdue', stats.overdue > 0],
   ];
-  $('#stats').innerHTML = cards.map(([key, label, alert]) => `
-    <div class="stat${alert ? ' alert' : ''}">
-      <b>${Number(stats[key] ?? 0)}</b><small>${label}</small>
-    </div>`).join('');
+  $('#stats').innerHTML = cards.map(([key, label, alert]) =>
+    `<span class="stat${alert ? ' alert' : ''}"><b>${Number(stats[key] ?? 0)}</b><small>${label}</small></span>`
+  ).join('');
 }
 
-function renderList(tasks) {
+// ---------- task list (left pane) ----------
+
+function renderList() {
   const list = $('#list');
   list.innerHTML = '';
-  $('#empty').hidden = tasks.length > 0;
-  $('#count').textContent = `${tasks.length} task${tasks.length === 1 ? '' : 's'}`;
+  $('#empty').hidden = state.tasks.length > 0;
+  $('#count').textContent = `${state.tasks.length} task${state.tasks.length === 1 ? '' : 's'}`;
 
   const today = new Date().toISOString().slice(0, 10);
-  for (const task of tasks) {
+  for (const task of state.tasks) {
     const li = document.createElement('li');
-    li.className = 'task' + (task.status === 'done' ? ' done' : '');
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'task'
+      + (task.status === 'done' ? ' done' : '')
+      + (state.selected === task.id ? ' selected' : '');
     const overdue = task.due_date && task.status !== 'done' && task.due_date < today;
-    const agentOptions = ['<option value="">— no agent —</option>']
-      .concat(state.agents.map((a) =>
-        `<option value="${a.id}"${task.agent_id === a.id ? ' selected' : ''}>${esc(a.name)}</option>`
-      ))
-      .join('');
-    li.innerHTML = `
-      <div class="body">
-        <p class="title">${esc(task.title)}</p>
-        ${task.description ? `<p class="desc">${esc(task.description)}</p>` : ''}
-        <div class="meta">
-          <button class="badge status-${esc(task.status)}" data-action="cycle" title="Advance status">
-            ${esc(task.status)}
-          </button>
-          <span class="badge prio-${esc(task.priority)}">${esc(task.priority)}</span>
-          ${task.due_date ? `<span class="badge due${overdue ? ' overdue' : ''}">due ${esc(task.due_date)}</span>` : ''}
-          ${task.workdir ? `<span class="badge" title="Working directory for agent runs">📁 ${esc(task.workdir)}</span>` : ''}
-          <select class="agent-select" data-action="assign" title="Assign an agent">
-            ${agentOptions}
-          </select>
-          <button class="primary" data-action="run" ${task.agent_id ? '' : 'disabled title="Assign an agent first"'}>▶ Run</button>
-        </div>
+    const agent = state.agents.find((a) => a.id === task.agent_id);
+    item.innerHTML = `
+      <div class="row1">
+        <span class="id">#${task.id}</span>
+        <span class="title">${esc(task.title)}</span>
       </div>
-      <div class="actions">
-        <button class="ghost" data-action="edit">Edit</button>
-        <button class="danger" data-action="delete">Delete</button>
+      <div class="sub">
+        <span class="badge status-${esc(task.status)}">${esc(task.status)}</span>
+        <span class="badge prio-${esc(task.priority)}">${esc(task.priority)}</span>
+        ${task.due_date ? `<span class="badge due${overdue ? ' overdue' : ''}">due ${esc(task.due_date)}</span>` : ''}
+        ${agent ? `<span class="badge agent">${esc(agent.name)}</span>` : ''}
       </div>`;
-    li.querySelector('[data-action="cycle"]').addEventListener('click', () => cycleStatus(task));
-    li.querySelector('[data-action="edit"]').addEventListener('click', () => startEdit(task));
-    li.querySelector('[data-action="delete"]').addEventListener('click', () => removeTask(task));
-    li.querySelector('[data-action="assign"]').addEventListener('change', (e) => assignAgent(task, e.target.value));
-    li.querySelector('[data-action="run"]').addEventListener('click', () => runTask(task));
+    item.addEventListener('click', () => selectTask(task.id));
+    li.appendChild(item);
     list.appendChild(li);
   }
+}
+
+function selectTask(id) {
+  state.selected = id;
+  renderList();
+  renderDetail();
+  // On narrow (single-column) layouts the detail pane sits below the list.
+  if (matchMedia('(max-width: 900px)').matches) {
+    $('#detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
+// ---------- detail pane (right) ----------
+
+function renderDetail() {
+  const pane = $('#detail');
+  const task = state.tasks.find((t) => t.id === state.selected);
+  if (!task) {
+    pane.innerHTML = '<div class="placeholder">Select a task to see its details.</div>';
+    return;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const overdue = task.due_date && task.status !== 'done' && task.due_date < today;
+  const agentOptions = ['<option value="">— no agent —</option>']
+    .concat(state.agents.map((a) =>
+      `<option value="${a.id}"${task.agent_id === a.id ? ' selected' : ''}>${esc(a.name)}</option>`
+    ))
+    .join('');
+  const created = new Date(task.created_at).toLocaleString();
+  const updated = new Date(task.updated_at).toLocaleString();
+
+  pane.innerHTML = `
+    <div class="head">
+      <span class="id">#${task.id}</span>
+      <h2>${esc(task.title)}</h2>
+    </div>
+    ${task.description
+      ? `<p class="desc">${esc(task.description)}</p>`
+      : '<p class="desc empty">No description.</p>'}
+    <div class="meta">
+      <button class="badge status-${esc(task.status)}" data-action="cycle" title="Advance status (todo → in_progress → done)">
+        ${esc(task.status)}
+      </button>
+      <span class="badge prio-${esc(task.priority)}">${esc(task.priority)}</span>
+      ${task.due_date ? `<span class="badge due${overdue ? ' overdue' : ''}">due ${esc(task.due_date)}</span>` : ''}
+      ${task.workdir ? `<span class="badge" title="Working directory for agent runs">📁 ${esc(task.workdir)}</span>` : ''}
+    </div>
+    <div class="actions">
+      <select data-action="assign" title="Assign an agent">${agentOptions}</select>
+      <button class="primary" data-action="run" ${task.agent_id ? '' : 'disabled title="Assign an agent first"'}>▶ Run agent</button>
+      <button class="ghost" data-action="edit">Edit</button>
+      <button class="danger" data-action="delete">Delete</button>
+    </div>
+    <p class="times">created ${esc(created)} · updated ${esc(updated)}</p>`;
+
+  pane.querySelector('[data-action="cycle"]').addEventListener('click', () => cycleStatus(task));
+  pane.querySelector('[data-action="edit"]').addEventListener('click', () => startEdit(task));
+  pane.querySelector('[data-action="delete"]').addEventListener('click', () => removeTask(task));
+  pane.querySelector('[data-action="assign"]').addEventListener('change', (e) => assignAgent(task, e.target.value));
+  pane.querySelector('[data-action="run"]').addEventListener('click', () => runTask(task));
 }
 
 async function assignAgent(task, agentId) {
@@ -481,7 +614,9 @@ function renderAgents() {
       <div class="head">
         <b>${esc(agent.name)}</b>
         <span class="badge">#${agent.id}</span>
-        ${agent.timeout_secs ? `<span class="badge">timeout ${agent.timeout_secs}s</span>` : ''}
+        ${agent.timeout_secs === 0
+          ? '<span class="badge">no timeout</span>'
+          : agent.timeout_secs ? `<span class="badge">timeout ${agent.timeout_secs}s</span>` : ''}
       </div>
       <div class="cmd">${esc(agent.command)}</div>
       ${agent.prompt_template ? `<div class="cmd">prompt: ${esc(agent.prompt_template)}</div>` : ''}
@@ -500,7 +635,7 @@ function startAgentEdit(agent) {
   $('#agent-name').value = agent.name;
   $('#agent-command').value = agent.command;
   $('#agent-prompt').value = agent.prompt_template || '';
-  $('#agent-timeout').value = agent.timeout_secs || '';
+  $('#agent-timeout').value = agent.timeout_secs ?? '';
   $('#agent-submit').textContent = 'Save agent';
   $('#agent-cancel').hidden = false;
   $('#agents-section').open = true;
@@ -529,7 +664,9 @@ $('#agent-form').addEventListener('submit', async (e) => {
     name: $('#agent-name').value,
     command: $('#agent-command').value,
     prompt_template: $('#agent-prompt').value || null,
-    timeout_secs: Number($('#agent-timeout').value) || 0,
+    // An empty field means "use the default" (null); an explicit 0 is a
+    // real value meaning "no timeout" and must survive the round-trip.
+    timeout_secs: $('#agent-timeout').value === '' ? null : Number($('#agent-timeout').value),
   };
   try {
     if (state.agentEditing) {
@@ -563,21 +700,122 @@ function renderRuns() {
         <span class="times">on task #${run.task_id} · started ${esc(started)}${ended ? ` · ended ${esc(ended)}` : ''}</span>
         <span class="spacer"></span>
         ${run.exit_code !== null && run.exit_code !== undefined ? `<span class="badge">exit ${run.exit_code}</span>` : ''}
+        ${run.status === 'running' || run.status === 'queued' ? `<button class="ghost" data-action="stream-run">👁 Live</button>` : ''}
         ${run.status === 'running' || run.status === 'queued' ? `<button class="danger" data-action="cancel-run">Cancel</button>` : ''}
+        <button class="danger" data-action="delete-run">Delete</button>
       </div>
       ${run.output ? `<pre>${esc(run.output)}</pre>` : ''}`;
     const cancelBtn = li.querySelector('[data-action="cancel-run"]');
     if (cancelBtn) cancelBtn.addEventListener('click', () => cancelRun(run));
+    const streamBtn = li.querySelector('[data-action="stream-run"]');
+    if (streamBtn) streamBtn.addEventListener('click', () => openStream(run));
+    li.querySelector('[data-action="delete-run"]').addEventListener('click', () => deleteRun(run));
     list.appendChild(li);
   }
 }
 
 async function cancelRun(run) {
   try {
+    await api(`/api/runs/${run.id}/cancel`, { method: 'POST' });
+    await refreshRuns();
+  } catch (err) { toast(err.message); }
+}
+
+async function deleteRun(run) {
+  if (!confirm(`Delete run #${run.id} (${run.agent_name})? This stops it if it is still running and removes it from history.`)) return;
+  try {
     await api(`/api/runs/${run.id}`, { method: 'DELETE' });
     await refreshRuns();
   } catch (err) { toast(err.message); }
 }
+
+// ---------- live conversation streaming ----------
+
+// One open stream at a time: opening another closes the previous.
+let streamAbort = null;
+
+// Watch a run's conversation live: the prompt the agent received, then its
+// stdout/stderr as it is produced, until the run ends. Uses fetch + a
+// ReadableStream reader instead of EventSource because EventSource cannot
+// send the Authorization header the server may require.
+async function openStream(run) {
+  if (streamAbort) streamAbort.abort();
+  streamAbort = new AbortController();
+
+  const dialog = $('#stream-dialog');
+  const log = $('#stream-log');
+  $('#stream-title').textContent = `Run #${run.id} — ${run.agent_name}`;
+  $('#stream-sub').textContent = `task #${run.task_id} · live conversation (prompt + output)`;
+  log.textContent = '';
+  dialog.showModal();
+
+  const append = (text, cls) => {
+    const span = document.createElement('span');
+    if (cls) span.className = cls;
+    span.textContent = text;
+    log.appendChild(span);
+    log.scrollTop = log.scrollHeight;
+  };
+
+  try {
+    const token = localStorage.getItem('orga-token');
+    const headers = { Accept: 'text/event-stream' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`/api/runs/${run.id}/stream`, {
+      headers, signal: streamAbort.signal,
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `HTTP ${res.status}`);
+    }
+
+    // Parse SSE frames out of the byte stream: events are separated by a
+    // blank line; `event:` names the type, `data:` carries the payload.
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sep;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        handleStreamFrame(frame, append);
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') append(`\n[stream error: ${err.message}]\n`, 'resync');
+  }
+}
+
+// One SSE frame: `event: <name>` + `data: <text>` lines.
+function handleStreamFrame(frame, append) {
+  let event = 'message';
+  const data = [];
+  for (const line of frame.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+  }
+  const text = data.join('\n');
+  switch (event) {
+    case 'prompt':  append(`── prompt ──\n${text}\n`, 'prompt'); break;
+    case 'output':  append(text); break;
+    case 'status':  append(`[${text}]\n`, 'note'); break;
+    case 'resync':  append('[output was truncated — re-open to see the full run output]\n', 'resync'); break;
+    case 'end':     append('── end of conversation ──\n', 'end'); break;
+  }
+}
+
+$('#stream-close').addEventListener('click', () => {
+  if (streamAbort) streamAbort.abort();
+  $('#stream-dialog').close();
+});
+// Esc closes a native <dialog>; abort the fetch so no reader keeps running.
+$('#stream-dialog').addEventListener('close', () => {
+  if (streamAbort) streamAbort.abort();
+});
 
 $('#form').addEventListener('submit', async (e) => {
   e.preventDefault();

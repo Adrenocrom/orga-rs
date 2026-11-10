@@ -61,20 +61,24 @@ server stops accepting connections and lets in-flight requests finish.
 Open http://127.0.0.1:3000 — a single-page dashboard (no build step, no
 JavaScript framework) that talks to the REST API:
 
-- **+ Add task** opens a dialog for creating a task; **Edit** reuses the same
-  dialog (Esc or Cancel discards the changes)
-- create / edit / delete tasks, filter by status and priority
-- click a task's status badge to cycle todo → in_progress → done
-- stat cards for total / todo / in progress / done / overdue
+- slim one-line header: title, stat pills (total / to do / in progress /
+  done / overdue), **+ Add task**, status and priority filters, task count
+- **two-pane layout**: the task list (with task ids) on the left, the
+  details of the selected task on the right — description, status badge
+  (click to cycle todo → in_progress → done), priority, due date, workdir,
+  agent assignment, **▶ Run agent**, edit and delete
+- create / edit / delete tasks, filter by status and priority; the
+  description field is generously sized by default
 - optional **workdir** per task — the directory its agent runs execute in
 - **Agents section**: configure agents (name, command, optional prompt
   template, timeout), edit and delete them
-- per task: pick an agent from the dropdown and press **▶ Run** — the agent
-  process is spawned by the server and works in the background; if the
-  agent is already busy, the run is queued and starts automatically
+- per task: pick an agent from the dropdown and press **▶ Run agent** — the
+  agent process is spawned by the server and works in the background; if
+  the agent is already busy, the run is queued and starts automatically
 - **Agent runs** section: live status of every run (queued/running/…),
-  captured output, cancel button for queued and running runs; the view
-  polls while runs are live
+  captured output, cancel button for queued and running runs, delete button
+  for any run (stops it first if still live); the view polls while runs
+  are live
 
 ## Agents
 
@@ -85,24 +89,28 @@ server:
 1. records a **run** (status `running`) and assigns the agent to the task,
 2. spawns `sh -c <command>` — **in the task's working directory** when one
    is set (see below),
-3. writes the rendered prompt to the process's **stdin**, then closes it,
+3. writes the rendered prompt to the process's **stdin**, followed by a
+   final `###END_OF_INPUT###` line, then closes it,
 4. supervises the process: exit 0 → `completed`, non-zero exit → `failed`,
-   over the configured timeout → `timed_out`, cancelled via the API →
-   `cancelled`,
+   over the configured timeout (when one is set) → `timed_out`, cancelled
+   via the API → `cancelled`,
 5. captures stdout + stderr (last 64 KiB) into the run record.
 
 The prompt is rendered from the agent's optional **prompt template** with
 the placeholders `{id}`, `{title}`, `{description}`, `{status}`,
 `{priority}`, `{due_date}` and `{workdir}` (`none` when unset). Without a
-template a sensible default prompt is used.
+template a sensible default prompt is used. The prompt is always terminated
+with a `###END_OF_INPUT###` line (not duplicated when the template already
+ends with it), so an agent can detect the end of the task text without
+waiting for stdin EOF.
 
 ### Per-agent queue
 
 **Each agent runs one task at a time.** When you run an agent that already
 has a live run, the new run is recorded with status `queued` and starts
 automatically when the current run ends (FIFO). Queued runs can be
-cancelled while they wait (`DELETE /api/runs/{id}`). Different agents are
-independent — a busy agent never blocks another.
+cancelled while they wait (`POST /api/runs/{id}/cancel`). Different agents
+are independent — a busy agent never blocks another.
 
 ### Working directory
 
@@ -149,7 +157,8 @@ Runs whose server died mid-flight are marked `failed` at the next startup
 | `DELETE` | `/api/agents/{id}`            | delete (assignments are cleared)         |
 | `GET`    | `/api/runs`                   | list runs, `?task_id=&status=&limit=`    |
 | `GET`    | `/api/runs/{id}`              | fetch one run incl. output               |
-| `DELETE` | `/api/runs/{id}`              | cancel a running run (409 if not running) |
+| `POST`   | `/api/runs/{id}/cancel`       | cancel a live run (409 if not live)      |
+| `DELETE` | `/api/runs/{id}`              | delete a run (stops it first if live)    |
 | `GET`    | `/api/stats`                  | counters incl. overdue                   |
 
 Task fields: `title` (required, 1–200 characters), `description`, `status`
@@ -164,7 +173,8 @@ and a message in `{"error": "..."}`.
 
 Agent fields: `name` (1–100 characters), `command` (1–2000 characters, run
 via `sh -c`), `prompt_template` (optional, ≤ 2000 characters, placeholders
-above), `timeout_secs` (optional, 0 or absent → 600, max 86400).
+above), `timeout_secs` (optional; absent or `0` → no timeout, max 86400).
+On `PUT`, omitted fields keep their value.
 
 Run fields: `id`, `task_id`, `agent_id`, `agent_name` (snapshot), `status`
 (`queued`/`running`/`completed`/`failed`/`timed_out`/`cancelled`), `exit_code`,
@@ -174,8 +184,9 @@ execution slot is taken; the run starts automatically when the slot frees.
 ## MCP tools
 
 The `mcp` subcommand speaks JSON-RPC 2.0 over stdio (MCP revision 2025-06-18)
-and exposes ten tools: `list_tasks`, `get_task`, `create_task`, `update_task`,
-`delete_task`, `task_stats`, `list_agents`, `run_task`, `get_run`, `list_runs`.
+and exposes eleven tools: `list_tasks`, `get_task`, `create_task`,
+`update_task`, `delete_task`, `task_stats`, `list_agents`, `run_task`,
+`get_run`, `list_runs`, `delete_run`.
 Tool-level failures (unknown id, invalid enum, server unreachable) are
 returned as `isError: true` results so the model can read and correct them.
 

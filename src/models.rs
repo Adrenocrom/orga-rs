@@ -153,9 +153,6 @@ pub const MAX_AGENT_NAME_LEN: usize = 100;
 /// Maximum length of the configured command and prompt template.
 pub const MAX_AGENT_TEXT_LEN: usize = 2000;
 
-/// Default timeout for an agent run, in seconds.
-pub const DEFAULT_RUN_TIMEOUT_SECS: u64 = 600;
-
 /// Maximum timeout a client may configure for an agent run, in seconds.
 pub const MAX_RUN_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
@@ -178,7 +175,9 @@ pub struct Agent {
     /// empty -> a default prompt.
     #[serde(default)]
     pub prompt_template: Option<String>,
-    /// Seconds before a run is killed; 0 or absent -> [`DEFAULT_RUN_TIMEOUT_SECS`].
+    /// Seconds before a run is killed. The timeout is optional: absent or 0
+    /// means no timeout — the run then ends only by its own exit or a
+    /// cancellation.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -320,7 +319,7 @@ fn check_prompt_template(template: Option<&str>) -> Result<(), String> {
 
 fn check_timeout(timeout: Option<u64>) -> Result<(), String> {
     match timeout {
-        None | Some(0) => Ok(()), // 0 -> default
+        None | Some(0) => Ok(()), // 0 -> no timeout
         Some(t) if t > MAX_RUN_TIMEOUT_SECS => Err(format!(
             "timeout_secs must be at most {MAX_RUN_TIMEOUT_SECS}"
         )),
@@ -559,7 +558,7 @@ mod tests {
         assert!(a.validate().is_ok());
         a.timeout_secs = Some(MAX_RUN_TIMEOUT_SECS + 1);
         assert!(a.validate().is_err());
-        a.timeout_secs = Some(0); // 0 -> default timeout
+        a.timeout_secs = Some(0); // 0 -> no timeout
         assert!(a.validate().is_ok());
     }
 

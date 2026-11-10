@@ -143,6 +143,7 @@ fn call_tool(api: &Api, params: &Value) -> Result<Value, Value> {
         "run_task" => tool_run_task(api, &args),
         "get_run" => tool_get_run(api, &args),
         "list_runs" => tool_list_runs(api, &args),
+        "delete_run" => tool_delete_run(api, &args),
         other => {
             return Err(json!({
                 "code": -32602,
@@ -349,6 +350,14 @@ fn run_line(run: &Value) -> String {
         field("status"),
         if exit.is_empty() { String::new() } else { format!(" ({exit})") }
     )
+}
+
+/// Delete a run record. A live run is stopped first, then removed from
+/// history entirely (unlike cancelling, which keeps the record).
+fn tool_delete_run(api: &Api, args: &Value) -> ToolResult {
+    let id = req_id(args)?;
+    api.delete(&format!("/api/runs/{id}"), "delete run")?;
+    Ok(ToolOutput::text(format!("run {id} deleted")))
 }
 
 /// Validate the task fields of a create/update call before sending them to
@@ -663,6 +672,17 @@ task_id and status (queued/running/completed/failed/timed_out/cancelled).",
                     "status": { "type": "string", "enum": json!(RUN_STATUSES) }
                 }
             }
+        },
+        {
+            "name": "delete_run",
+            "description": "Delete a run record by id. A live run is stopped first, \
+then removed from history entirely (unlike cancelling, which keeps the record). \
+Use this to clean up runs you no longer want.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": id_schema },
+                "required": ["id"]
+            }
         }
     ])
 }
@@ -834,7 +854,7 @@ mod tests {
         assert!(responses[0]["result"]["instructions"].as_str().unwrap().contains("YYYY-MM-DD"));
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         let stats_tool = tools.iter().find(|t| t["name"] == "task_stats").unwrap();
         assert!(stats_tool["outputSchema"].is_object());
 

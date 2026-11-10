@@ -322,7 +322,7 @@ impl Db {
 
     /// Merge `input` into the existing agent. Returns `None` if the id is
     /// unknown. An empty `prompt_template` clears it (back to the default
-    /// prompt); an empty `timeout_secs` (0) resets it to the default.
+    /// prompt); a `timeout_secs` of 0 disables the timeout entirely.
     pub fn update_agent(
         &mut self,
         id: i64,
@@ -349,8 +349,7 @@ impl Db {
                 Some(t) => normalize_template(Some(t)), // "" -> None (default prompt)
             },            timeout_secs: match input.timeout_secs {
                 None => existing.timeout_secs, // not provided -> keep
-                Some(0) => None,               // 0 -> default timeout
-                Some(t) => Some(t),
+                Some(t) => Some(t),            // 0 -> no timeout (a real value)
             },
         };
         tx.execute(
@@ -588,6 +587,15 @@ impl Db {
         )?;
         Ok(changed == 1)
     }
+
+    /// Delete a run record. Returns `false` if the id did not exist. The
+    /// caller owns the policy for live runs: the web layer stops a running
+    /// process before deleting (the supervisor tolerates its final write
+    /// landing on a row that is already gone), and a queued run leaves the
+    /// queue simply by losing its row.
+    pub fn delete_run(&self, id: i64) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute("DELETE FROM runs WHERE id = ?1", params![id])? > 0)
+    }
 }
 
 /// Treat a missing or whitespace-only prompt template as "use the default".
@@ -770,6 +778,80 @@ mod tests {
         assert_eq!(run.status, "failed");
         assert!(run.output.contains("agent deleted"));
         assert!(run.ended_at.is_some());
+    }
+
+    #[test]
+    fn delete_run_removes_the_record() {
+        let db = db();
+        let task = db.create(&create("runnable")).unwrap();
+        let agent = db
+            .create_agent(&CreateAgent {
+                name: "runner".into(),
+                command: "true".into(),
+                prompt_template: None,
+                timeout_secs: None,
+            })
+            .unwrap();
+        let run = db
+            .create_run(task.id, &agent, crate::models::RunStatus::Queued)
+            .unwrap();
+
+        assert!(db.delete_run(run.id).unwrap());
+        assert!(db.get_run(run.id).unwrap().is_none());
+        assert!(!db.delete_run(run.id).unwrap()); // already gone
+    }
+
+    #[test]
+    fn agent_timeout_zero_is_a_real_value_and_survives_updates() {
+        let mut db = db();
+        let agent = db
+            .create_agent(&CreateAgent {
+                name: "no-limit".into(),
+                command: "true".into(),
+                prompt_template: None,
+                timeout_secs: Some(0), // no timeout
+            })
+            .unwrap();
+        assert_eq!(agent.timeout_secs, Some(0));
+
+        // an update that omits the field keeps the 0
+        let updated = db
+            .update_agent(
+                agent.id,
+                &UpdateAgent {
+                    name: Some("renamed".into()),
+                    ..UpdateAgent::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.timeout_secs, Some(0));
+
+        // an explicit 0 also survives (it is not rewritten to the default)
+        let updated = db
+            .update_agent(
+                agent.id,
+                &UpdateAgent {
+                    timeout_secs: Some(0),
+                    ..UpdateAgent::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.timeout_secs, Some(0));
+
+        // a positive value still works, and null means "keep"
+        let updated = db
+            .update_agent(
+                agent.id,
+                &UpdateAgent {
+                    timeout_secs: Some(30),
+                    ..UpdateAgent::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.timeout_secs, Some(30));
     }
 
     #[test]
