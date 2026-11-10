@@ -21,3 +21,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(unix)'.dependencies]
+# kill(2) for the runner's process-group kill: a cancelled, deleted or
+# timed-out run must take its whole process tree down, not just the `sh -c`
+# wrapper (see runner::kill_tree).
+libc = "0.2"

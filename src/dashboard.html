@@ -146,6 +146,12 @@
   }
   form .row { display: flex; gap: 10px; flex-wrap: wrap; }
   form .row > * { flex: 1; min-width: 130px; }
+  /* Grid items default to min-width: auto — they refuse to shrink below
+     their content. The workdir select's longest <option> (a long absolute
+     path) made the .row wider than the dialog, spilling past its right
+     edge. min-width: 0 lets the row shrink to the dialog; the select then
+     clips its text (the open dropdown still shows the full paths). */
+  form > * { min-width: 0; }
   .form-actions { display: flex; gap: 10px; }
 
   /* agents section (collapsible) */
@@ -204,7 +210,8 @@
 
   /* live conversation dialog */
   #stream-dialog { width: min(860px, calc(100vw - 48px)); }
-  #stream-dialog h2 { margin: 0 0 4px; font-size: 17px; }
+  /* the title carries the run's agent name — keep a long one inside the dialog */
+  #stream-dialog h2 { margin: 0 0 4px; font-size: 17px; overflow-wrap: anywhere; }
   #stream-dialog .sub { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
   #stream-dialog .stream-bar { display: flex; gap: 10px; align-items: flex-start; }
   #stream-dialog .stream-bar > div { flex: 1; min-width: 0; }
@@ -409,12 +416,64 @@ const state = {
   runs: [],                 // recent runs
   pollTimer: null,          // runs polling while any run is live
   expandedRuns: new Set(),  // run ids whose output block is expanded
+  sig: {},                  // per region: signature of the data last rendered
 };
 
 // Escape user content before it goes into innerHTML.
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
 ));
+
+// ---------- render signatures ----------
+//
+// The background refresh (every 3s while a run is live) used to rebuild
+// every region from scratch on every tick. That reset the scroll offset of
+// every scrollable element inside them (a run's <pre> output block, the
+// panes) and closed any open <select> dropdown — the user was reading the
+// output, the refresh wiped their place. Now each region renders only
+// when its data actually changed: a signature (stable JSON, key order
+// ignored) is kept per region, and an unchanged signature means the DOM
+// is left completely alone.
+function sig(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return '[' + value.map(sig).join(',') + ']';
+  return '{' + Object.keys(value).sort().map((k) => JSON.stringify(k) + ':' + sig(value[k])).join(',') + '}';
+}
+
+// Render `region` (a key in state.sig) only when its data changed since the
+// last render. Returns true when the DOM was rebuilt.
+//
+// `opts.force` bypasses both checks — for user-initiated renders (a click,
+// a form submit), which must be reflected immediately.
+//
+// `opts.guard` is a container element: while it holds the focus, the
+// rebuild is deferred and retried when the focus leaves. An open native
+// <select> dropdown keeps the focus on the select, so this is what keeps
+// a dropdown from being closed by a refresh that arrives while the user
+// is still choosing. Dismissing the dropdown without picking anything
+// fires no `change` event — the `focusout` retry covers that case. Only
+// one retry is ever pending per region; it re-reads the data when it
+// fires, so it catches up everything that changed in the meantime.
+const pendingRetry = new Set();
+function renderIfChanged(region, getData, build, opts = {}) {
+  const s = sig(getData());
+  if (!opts.force && state.sig[region] === s) return false;
+  if (!opts.force && opts.guard && opts.guard.contains(document.activeElement)) {
+    if (pendingRetry.has(region)) return false;
+    pendingRetry.add(region);
+    const guard = opts.guard;
+    const retry = () => {
+      guard.removeEventListener('focusout', retry);
+      pendingRetry.delete(region);
+      renderIfChanged(region, getData, build, opts);
+    };
+    guard.addEventListener('focusout', retry);
+    return false;
+  }
+  state.sig[region] = s;
+  build();
+  return true;
+}
 
 // Shared API token (ORGA_TOKEN), remembered after the first successful use.
 async function api(path, options = {}) {
@@ -444,7 +503,7 @@ async function api(path, options = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-async function load() {
+async function load(opts = {}) {
   try {
     const params = new URLSearchParams();
     if (state.status) params.set('status', state.status);
@@ -462,7 +521,7 @@ async function load() {
     state.workdirs = workdirs;
     state.runs = runs;
     renderList();
-    renderDetail();
+    renderDetail(opts);
     renderProjects();
     renderAgents();
     renderRuns();
@@ -503,21 +562,37 @@ async function refreshRuns() {
 }
 
 function renderStats(stats) {
-  const cards = [
-    ['total', 'Total', false],
-    ['todo', 'To do', false],
-    ['in_progress', 'In progress', false],
-    ['done', 'Done', false],
-    ['overdue', 'Overdue', stats.overdue > 0],
-  ];
-  $('#stats').innerHTML = cards.map(([key, label, alert]) =>
-    `<span class="stat${alert ? ' alert' : ''}"><b>${Number(stats[key] ?? 0)}</b><small>${label}</small></span>`
-  ).join('');
+  renderIfChanged('stats', () => stats, () => {
+    const cards = [
+      ['total', 'Total', false],
+      ['todo', 'To do', false],
+      ['in_progress', 'In progress', false],
+      ['done', 'Done', false],
+      ['overdue', 'Overdue', stats.overdue > 0],
+    ];
+    $('#stats').innerHTML = cards.map(([key, label, alert]) =>
+      `<span class="stat${alert ? ' alert' : ''}"><b>${Number(stats[key] ?? 0)}</b><small>${label}</small></span>`
+    ).join('');
+  });
 }
 
 // ---------- task list (left pane) ----------
 
+// Every render*() below renders only when its data changed since the last
+// render (see renderIfChanged). The background refresh re-fetches tasks
+// and runs every few seconds while an agent is live; without the check it
+// also rebuilt the panes on every tick, which reset the panes' scroll
+// offsets and closed an open dropdown in the detail pane.
+
 function renderList() {
+  renderIfChanged('list',
+    () => ({ tasks: state.tasks, selected: state.selected, agents: state.agents }),
+    buildList);
+}
+
+function buildList() {
+  const pane = $('.pane-scroll');
+  const scrollTop = pane.scrollTop; // keep the reading position on rebuild
   const list = $('#list');
   list.innerHTML = '';
   $('#empty').hidden = state.tasks.length > 0;
@@ -548,12 +623,13 @@ function renderList() {
     li.appendChild(item);
     list.appendChild(li);
   }
+  pane.scrollTop = scrollTop;
 }
 
 function selectTask(id) {
   state.selected = id;
   renderList();
-  renderDetail();
+  renderDetail({ force: true });
   // On narrow (single-column) layouts the detail pane sits below the list.
   if (matchMedia('(max-width: 900px)').matches) {
     $('#detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -562,9 +638,24 @@ function selectTask(id) {
 
 // ---------- detail pane (right) ----------
 
-function renderDetail() {
+function renderDetail(opts = {}) {
+  renderIfChanged('detail',
+    () => ({ task: state.tasks.find((t) => t.id === state.selected), agents: state.agents }),
+    buildDetail,
+    { ...opts, guard: $('#detail') });
+}
+
+// The task the detail pane last showed: the scroll offset is preserved
+// across re-renders of the same task, but selecting a different task
+// starts at its top (the content is new).
+let lastDetailTaskId = null;
+
+function buildDetail() {
   const pane = $('#detail');
   const task = state.tasks.find((t) => t.id === state.selected);
+  const scrollTop = pane.scrollTop; // keep the reading position on rebuild
+  const sameTask = lastDetailTaskId === (task ? task.id : null);
+  lastDetailTaskId = task ? task.id : null;
   if (!task) {
     pane.innerHTML = '<div class="placeholder">Select a task to see its details.</div>';
     return;
@@ -609,6 +700,9 @@ function renderDetail() {
   pane.querySelector('[data-action="delete"]').addEventListener('click', () => removeTask(task));
   pane.querySelector('[data-action="assign"]').addEventListener('change', (e) => assignAgent(task, e.target.value));
   pane.querySelector('[data-action="run"]').addEventListener('click', () => runTask(task));
+  // Same task re-rendered: keep the reading position. A different task:
+  // start at the top — the content is new.
+  pane.scrollTop = sameTask ? scrollTop : 0;
 }
 
 async function assignAgent(task, agentId) {
@@ -621,7 +715,7 @@ async function assignAgent(task, agentId) {
     } else {
       await api(`/api/tasks/${task.id}/agent`, { method: 'DELETE' });
     }
-    await load();
+    await load({ force: true });
   } catch (err) { toast(err.message); }
 }
 
@@ -631,7 +725,7 @@ async function runTask(task) {
     toast(run.status === 'queued'
       ? `Agent is busy — run #${run.id} queued (starts when the current run ends)`
       : `Agent started (run #${run.id})`);
-    await load();
+    await load({ force: true });
   } catch (err) { toast(err.message); }
 }
 
@@ -639,7 +733,7 @@ async function cycleStatus(task) {
   const next = { todo: 'in_progress', in_progress: 'done', done: 'todo' }[task.status] || 'todo';
   try {
     await api(`/api/tasks/${task.id}`, { method: 'PUT', body: JSON.stringify({ status: next }) });
-    await load();
+    await load({ force: true });
   } catch (err) { toast(err.message); }
 }
 
@@ -792,7 +886,7 @@ async function removeTask(task) {
   try {
     await api(`/api/tasks/${task.id}`, { method: 'DELETE' });
     if (state.editing === task.id) closeTaskDialog();
-    await load();
+    await load({ force: true });
   } catch (err) { toast(err.message); }
 }
 
@@ -870,7 +964,7 @@ async function removeAgent(agent) {
   try {
     await api(`/api/agents/${agent.id}`, { method: 'DELETE' });
     if (state.agentEditing === agent.id) closeAgentDialog();
-    await load();
+    await load({ force: true });
   } catch (err) { toast(err.message); }
 }
 
@@ -894,7 +988,7 @@ $('#agent-form').addEventListener('submit', async (e) => {
       await api('/api/agents', { method: 'POST', body: JSON.stringify(payload) });
     }
     closeAgentDialog();
-    await load();
+    await load({ force: true });
   } catch (err) { toast(err.message); }
 });
 
@@ -903,7 +997,31 @@ $('#agent-cancel').addEventListener('click', closeAgentDialog);
 // ---------- runs ----------
 
 function renderRuns() {
+  // expandedRuns is deliberately not part of the signature: a toggle needs
+  // no rebuild (the native <details> already shows the new state, the
+  // listener records it, and any later rebuild reads it from the state).
+  renderIfChanged('runs', () => state.runs, buildRuns);
+}
+
+function buildRuns() {
   const list = $('#run-list');
+  // Remember each output block's scroll state before the rebuild, so a
+  // growing output does not yank the user back to the top: someone who
+  // scrolled up to read keeps their offset, someone following the tail
+  // stays pinned to the bottom. atBottom only counts when the block was
+  // actually scrollable — a collapsed <details> has no height and would
+  // otherwise degenerate to "at the bottom".
+  const scroll = new Map();
+  for (const pre of list.querySelectorAll('details.run-output > pre')) {
+    const id = Number(pre.dataset.runId);
+    if (!id) continue;
+    const scrollable = pre.scrollHeight > pre.clientHeight + 2;
+    scroll.set(id, {
+      top: pre.scrollTop,
+      atBottom: scrollable && pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 2,
+    });
+  }
+
   list.innerHTML = '';
   $('#runs-empty').hidden = state.runs.length > 0;
 
@@ -926,7 +1044,7 @@ function renderRuns() {
       ${run.output ? `
       <details class="run-output"${state.expandedRuns.has(run.id) ? ' open' : ''}>
         <summary>output (${run.output.length.toLocaleString()} characters)</summary>
-        <pre>${esc(run.output)}</pre>
+        <pre data-run-id="${run.id}">${esc(run.output)}</pre>
       </details>` : ''}`;
     const cancelBtn = li.querySelector('[data-action="cancel-run"]');
     if (cancelBtn) cancelBtn.addEventListener('click', () => cancelRun(run));
@@ -941,6 +1059,13 @@ function renderRuns() {
       else state.expandedRuns.delete(run.id);
     });
     list.appendChild(li);
+  }
+
+  // Restore the scroll state after the list is in the document — a detached
+  // element has no layout, so scrollTop could not be set while building.
+  for (const pre of list.querySelectorAll('details.run-output > pre')) {
+    const s = scroll.get(Number(pre.dataset.runId));
+    if (s) pre.scrollTop = s.atBottom ? pre.scrollHeight : s.top;
   }
 }
 
@@ -1180,20 +1305,37 @@ function updateStreamToggle() {
 function rebuildStreamOutput() {
   if (!streamOutputEl) return;
   const log = $('#stream-log');
+  const follow = streamFollowing();
   const el = document.createElement(streamMode === 'md' ? 'div' : 'pre');
   el.className = streamMode === 'md' ? 'md' : 'raw';
   if (streamMode === 'md') el.innerHTML = renderMarkdown(streamOutput);
   else el.textContent = streamOutput;
   log.replaceChild(el, streamOutputEl);
   streamOutputEl = el;
+  if (follow) scrollStreamLog();
+}
+
+// Is the user following the live output? True while they are at (or within
+// a few pixels of) the bottom. Scrolling up to read something pauses the
+// auto-scroll — streaming output used to force the scroll on every chunk,
+// so the position was yanked back down a moment later. Scrolling back to
+// the bottom resumes it.
+function streamFollowing() {
+  const log = $('#stream-log');
+  return log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+}
+
+function scrollStreamLog() {
+  const log = $('#stream-log');
   log.scrollTop = log.scrollHeight;
 }
 
 // A chunk of agent output: append in raw mode; in markdown mode re-render
 // the whole accumulated text, at most once per animation frame.
 function appendOutput(text) {
-  streamOutput += text;
   const log = $('#stream-log');
+  const follow = streamFollowing(); // before the append — see above
+  streamOutput += text;
   if (!streamOutputEl) {
     streamOutputEl = document.createElement(streamMode === 'md' ? 'div' : 'pre');
     streamOutputEl.className = streamMode === 'md' ? 'md' : 'raw';
@@ -1206,24 +1348,25 @@ function appendOutput(text) {
         mdRenderPending = false;
         if (streamOutputEl && streamMode === 'md') {
           streamOutputEl.innerHTML = renderMarkdown(streamOutput);
-          log.scrollTop = log.scrollHeight;
+          if (follow) scrollStreamLog();
         }
       });
     }
   } else {
     streamOutputEl.appendChild(document.createTextNode(text));
-    log.scrollTop = log.scrollHeight;
+    if (follow) scrollStreamLog();
   }
 }
 
 // Prompt, status and error segments are always plain text.
 function appendSegment(text, cls) {
   const log = $('#stream-log');
+  const follow = streamFollowing();
   const span = document.createElement('span');
   if (cls) span.className = cls;
   span.textContent = text;
   log.appendChild(span);
-  log.scrollTop = log.scrollHeight;
+  if (follow) scrollStreamLog();
 }
 
 // Watch a run's conversation: the prompt the agent received, then its
@@ -1339,13 +1482,23 @@ $('#form').addEventListener('submit', async (e) => {
       await api('/api/tasks', { method: 'POST', body: JSON.stringify(payload) });
     }
     closeTaskDialog();
-    await load();
+    await load({ force: true });
   } catch (err) { toast(err.message); }
 });
 
 $('#cancel').addEventListener('click', closeTaskDialog);
-$('#filter-status').addEventListener('change', (e) => { state.status = e.target.value; load(); });
-$('#filter-priority').addEventListener('change', (e) => { state.priority = e.target.value; load(); });
+
+// Changing a filter is a user-initiated view change: after the reload the
+// list shows a different set of tasks, so it starts at the top (background
+// updates keep the reading position instead).
+async function applyFilters() {
+  state.status = $('#filter-status').value;
+  state.priority = $('#filter-priority').value;
+  await load({ force: true });
+  $('.pane-scroll').scrollTop = 0;
+}
+$('#filter-status').addEventListener('change', applyFilters);
+$('#filter-priority').addEventListener('change', applyFilters);
 
 let toastTimer;
 function toast(message) {

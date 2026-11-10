@@ -588,6 +588,19 @@ impl Db {
         Ok(changed == 1)
     }
 
+    /// Mark every `queued` run as cancelled. Used by the server's graceful
+    /// shutdown: a queued run has no process yet, but the queue's pickup
+    /// would spawn one the moment a slot frees — flipping the rows first
+    /// keeps the shutdown from starting new agents on the way out.
+    pub fn cancel_queued_runs(&self) -> rusqlite::Result<usize> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET status = 'cancelled', ended_at = ?1
+             WHERE status = 'queued'",
+            params![chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed)
+    }
+
     /// Delete a run record. Returns `false` if the id did not exist. The
     /// caller owns the policy for live runs: the web layer stops a running
     /// process before deleting (the supervisor tolerates its final write

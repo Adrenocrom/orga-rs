@@ -49,13 +49,21 @@ pub async fn serve(
         println!("Auth enabled: API requests must send 'Authorization: Bearer <ORGA_TOKEN>'");
     }
     let state = AppState {
-        db,
+        db: db.clone(),
         registry: Arc::new(RunRegistry::default()),
         slots: Arc::new(AgentSlots::default()),
         workdirs: crate::workdirs_path(),
     };
+    let registry = state.registry.clone();
     axum::serve(listener, router(state, token))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Agent processes run in their own process groups, so they do
+            // not receive the terminal's Ctrl-C — the server must kill
+            // them itself or they would outlive it (and the queued ones
+            // would even be spawned on the way out).
+            runner::shutdown_all(db, registry).await;
+        })
         .await?;
     Ok(())
 }
@@ -544,11 +552,12 @@ async fn delete_run(
         let guard = lock_db(&state.db)?;
         let run = guard.get_run(id)?.ok_or(AppError::NotFound)?;
         if run.status == "running" {
-            // Ask the live process to stop. `false` means no live
-            // supervisor exists (e.g. the server restarted mid-run) —
-            // nothing to kill. Either way the supervisor tolerates its
-            // final write landing on a row that is already gone, and
-            // still releases the agent's slot.
+            // Ask the live process tree to stop (the registry's cancel
+            // kills the whole process group, not just the `sh -c`
+            // wrapper). `false` means no live supervisor exists (e.g. the
+            // server restarted mid-run) — nothing to kill. Either way the
+            // supervisor tolerates its final write landing on a row that
+            // is already gone, and still releases the agent's slot.
             state.registry.cancel(id);
         }
         guard.delete_run(id)?
@@ -806,6 +815,22 @@ mod tests {
         assert!(html.contains("renderProjects"));
         assert!(html.contains("addProject"));
         assert!(html.contains("removeProject"));
+        // The modal dialogs must not overflow horizontally: grid items
+        // default to min-width: auto, so the workdir select's longest
+        // <option> (a long absolute path) pushed the form's .row past the
+        // dialog's right edge. The rule lets the row shrink instead.
+        assert!(html.contains("form > * { min-width: 0; }"));
+        // The background refresh must not disturb the view: regions render
+        // only when their data changed (renderIfChanged + signatures), the
+        // detail pane defers a rebuild while it holds the focus (an open
+        // <select> dropdown would otherwise be closed by the refresh), and
+        // the conversation view only auto-scrolls while the user is at the
+        // bottom (streamFollowing) instead of on every chunk.
+        assert!(html.contains("renderIfChanged"));
+        assert!(html.contains("function sig("));
+        assert!(html.contains("guard: $('#detail')"));
+        assert!(html.contains("streamFollowing"));
+        assert!(html.contains("data-run-id="));
     }
 
     /// The dashboard's script block must stay syntactically balanced. A
@@ -1711,6 +1736,144 @@ mod tests {
         // Clean up: stop the run so the test does not leave a process.
         let res = call(&app, "POST", &format!("/api/runs/{fresh_id}/cancel"), None).await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    // ---------- cancel/delete kill the whole process tree ----------
+
+    /// A unique marker file per test, so parallel tests never share one.
+    fn tree_marker() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "orga-rs-web-tree-{}-{}.pid",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    /// Is a pid alive? `kill(pid, 0)` probes without sending a signal.
+    #[cfg(unix)]
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks permission/existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Poll the marker file until the backgrounded grandchild has reported
+    /// its pid.
+    #[cfg(unix)]
+    async fn wait_for_grandchild_pid(marker: &std::path::Path) -> i32 {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(marker) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the grandchild never reported its pid");
+    }
+
+    /// Wait until a pid is gone (or panic on timeout).
+    #[cfg(unix)]
+    async fn wait_for_pid_gone(pid: i32) {
+        for _ in 0..200 {
+            if !pid_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the agent process (pid {pid}) survived the kill");
+    }
+
+    /// The regression tests for the reported bug, through the real HTTP
+    /// endpoints: cancelling or deleting a live run must kill the agent
+    /// process itself, not just the `sh -c` wrapper around it. The agent
+    /// command backgrounds a `sleep` (the "agent" grandchild) and `wait`s,
+    /// so the wrapper stays alive while the grandchild runs — a child-only
+    /// kill would leave the grandchild running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_endpoint_kills_the_agent_process() {
+        let app = app();
+        let (task_id, _agent_id) = seed_task_agent(&app).await;
+        let marker = tree_marker();
+        let command = format!(
+            "sleep 300 & echo $! > \"{}\"; wait",
+            marker.to_string_lossy()
+        );
+        let res = call(
+            &app,
+            "POST",
+            "/api/agents",
+            Some(&serde_json::to_string(&json!({
+                "name": "tree",
+                "command": command,
+                "timeout_secs": 0
+            }))
+            .unwrap()),
+        )
+        .await;
+        let agent_id = body_json(res).await["id"].as_i64().unwrap();
+
+        let res = call(
+            &app,
+            "POST",
+            &format!("/api/tasks/{task_id}/run"),
+            Some(&format!(r#"{{"agent_id":{agent_id}}}"#)),
+        )
+        .await;
+        let run_id = body_json(res).await["id"].as_i64().unwrap();
+        // Wait for the grandchild to be up before cancelling — otherwise
+        // the cancel can win the race and the test proves nothing.
+        let grandchild = wait_for_grandchild_pid(&marker).await;
+
+        let res = call(&app, "POST", &format!("/api/runs/{run_id}/cancel"), None).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        wait_for_pid_gone(grandchild).await;
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_endpoint_kills_the_agent_process() {
+        let app = app();
+        let (task_id, _agent_id) = seed_task_agent(&app).await;
+        let marker = tree_marker();
+        let command = format!(
+            "sleep 300 & echo $! > \"{}\"; wait",
+            marker.to_string_lossy()
+        );
+        let res = call(
+            &app,
+            "POST",
+            "/api/agents",
+            Some(&serde_json::to_string(&json!({
+                "name": "tree",
+                "command": command,
+                "timeout_secs": 0
+            }))
+            .unwrap()),
+        )
+        .await;
+        let agent_id = body_json(res).await["id"].as_i64().unwrap();
+
+        let res = call(
+            &app,
+            "POST",
+            &format!("/api/tasks/{task_id}/run"),
+            Some(&format!(r#"{{"agent_id":{agent_id}}}"#)),
+        )
+        .await;
+        let run_id = body_json(res).await["id"].as_i64().unwrap();
+        // Wait for the grandchild to be up before deleting — otherwise the
+        // delete can win the race and the test proves nothing.
+        let grandchild = wait_for_grandchild_pid(&marker).await;
+
+        let res = call(&app, "DELETE", &format!("/api/runs/{run_id}"), None).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        wait_for_pid_gone(grandchild).await;
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[tokio::test]

@@ -103,13 +103,23 @@ server:
 
 1. records a **run** (status `running`) and assigns the agent to the task,
 2. spawns `sh -c <command>` — **in the task's working directory** when one
-   is set (see below),
+   is set (see below) — in its **own process group**,
 3. writes the rendered prompt to the process's **stdin**, followed by a
    final `###END_OF_INPUT###` line, then closes it,
 4. supervises the process: exit 0 → `completed`, non-zero exit → `failed`,
    over the configured timeout (when one is set) → `timed_out`, cancelled
    via the API → `cancelled`,
 5. captures stdout + stderr (last 64 KiB) into the run record.
+
+**Killing a run kills the whole tree.** The direct child is only the
+`sh -c` wrapper, so a kill of the child alone would leave the real agent
+process running. Every run therefore gets its own process group, and
+cancel (`POST /api/runs/{id}/cancel`), delete (`DELETE /api/runs/{id}`) and
+the timeout all signal the **group** — the wrapper, the agent and anything
+else the command started die together. A side effect of the separate group:
+agents do not receive the terminal's Ctrl-C, so on shutdown (Ctrl-C or
+SIGTERM of `serve`) the server kills all live runs itself and cancels
+queued ones instead of starting them on the way out.
 
 The prompt is rendered from the agent's optional **prompt template** with
 the placeholders `{id}`, `{title}`, `{description}`, `{status}`,
@@ -212,8 +222,8 @@ Runs whose server died mid-flight are marked `failed` at the next startup
 | `DELETE` | `/api/agents/{id}`            | delete (assignments are cleared)         |
 | `GET`    | `/api/runs`                   | list runs, `?task_id=&status=&limit=`    |
 | `GET`    | `/api/runs/{id}`              | fetch one run incl. output               |
-| `POST`   | `/api/runs/{id}/cancel`       | cancel a live run (409 if not live)      |
-| `DELETE` | `/api/runs/{id}`              | delete a run (stops it first if live)    |
+| `POST`   | `/api/runs/{id}/cancel`       | cancel a live run (409 if not live) — kills its whole process tree |
+| `DELETE` | `/api/runs/{id}`              | delete a run (kills its process tree first if live) |
 | `GET`    | `/api/workdirs`               | configured working directories          |
 | `POST`   | `/api/workdirs`               | add one (`{"workdir": "/abs/path"}`), returns the updated list |
 | `DELETE` | `/api/workdirs?workdir=/abs/path` | remove one (no-op when absent), returns the updated list |

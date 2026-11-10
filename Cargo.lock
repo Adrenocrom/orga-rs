@@ -592,6 +592,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

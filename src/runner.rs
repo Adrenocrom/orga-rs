@@ -24,6 +24,17 @@
 //! Output (stdout + stderr) is captured up to [`MAX_RUN_OUTPUT_BYTES`],
 //! keeping the tail — the interesting part of a log is usually the end.
 //!
+//! **Killing the whole tree:** the command runs as `sh -c <command>`, so the
+//! direct child is usually just a shell wrapper around the real agent
+//! process. Killing only the child would leave the agent running — the bug
+//! this module guards against. Every run is therefore spawned in its **own
+//! process group** ([`Command::process_group`]), and a kill (cancel, delete,
+//! timeout) is delivered to the **group** (`kill(-pgid, SIGKILL)`), taking
+//! the wrapper and every process it started down together. A side effect of
+//! the separate group: the agent no longer receives the terminal's Ctrl-C,
+//! so the server's graceful shutdown must kill live runs itself —
+//! [`shutdown_all`] does.
+//!
 //! Every prompt is terminated with the [`END_OF_INPUT_MARKER`] line so
 //! agents can detect the end of the task text without waiting for stdin
 //! EOF (the runner closes stdin right after, so EOF still follows).
@@ -135,6 +146,18 @@ fn event_len(event: &RunEvent) -> usize {
 pub struct RunRegistry {
     senders: Mutex<HashMap<i64, mpsc::Sender<()>>>,
     streams: Mutex<HashMap<i64, std::sync::Arc<RunStream>>>,
+    /// Fires when the last live supervisor finishes — the shutdown hook
+    /// waits on it so killed processes are really gone before the exit.
+    idle: tokio::sync::Notify,
+    /// The spawn gate: `true` once the server is shutting down. The mutex
+    /// is held across every check-spawn-register sequence (see
+    /// [`RunRegistry::spawn_or_refuse`]), so a shutdown that closes the
+    /// gate can never miss a run that is mid-spawn: either the run
+    /// registered before the gate closed — [`RunRegistry::cancel_all`]
+    /// then reaches it — or it is refused and no process is created.
+    /// Without the gate, a run started by an in-flight request during the
+    /// shutdown would never be cancelled and the shutdown would hang.
+    shutting_down: Mutex<bool>,
 }
 
 impl RunRegistry {
@@ -153,6 +176,42 @@ impl RunRegistry {
         }
     }
 
+    /// Ask **every** live run to stop. Used by the server's graceful
+    /// shutdown: agent processes run in their own process groups (see
+    /// [`kill_tree`]), so they no longer receive the terminal's Ctrl-C —
+    /// the server must kill them explicitly or they would outlive it.
+    ///
+    /// Closes the spawn gate first (under its lock), so no run can slip
+    /// into existence between this sweep and the exit: a concurrent spawn
+    /// either registered before the gate closed — and is cancelled here —
+    /// or is refused by the gate and never creates a process.
+    pub fn cancel_all(&self) {
+        if let Ok(mut gate) = self.shutting_down.lock() {
+            *gate = true;
+        }
+        if let Ok(map) = self.senders.lock() {
+            for tx in map.values() {
+                let _ = tx.try_send(());
+            }
+        }
+    }
+
+    /// The spawn gate. `Ok(())` when the server is live and the run may be
+    /// spawned; `Err` when it is shutting down — the run must not start.
+    /// The gate lock is held by the caller for the whole check-spawn-
+    /// register sequence (see [`spawn_and_supervise`]), which is what makes
+    /// the shutdown race-free.
+    pub fn spawn_or_refuse(&self) -> Result<std::sync::MutexGuard<'_, bool>, String> {
+        let gate = self
+            .shutting_down
+            .lock()
+            .map_err(|_| "registry mutex poisoned".to_string())?;
+        if *gate {
+            return Err("server is shutting down, the run was not started".to_string());
+        }
+        Ok(gate)
+    }
+
     fn insert(&self, run_id: i64, tx: mpsc::Sender<()>) {
         if let Ok(mut map) = self.senders.lock() {
             map.insert(run_id, tx);
@@ -160,8 +219,35 @@ impl RunRegistry {
     }
 
     fn remove(&self, run_id: i64) {
-        if let Ok(mut map) = self.senders.lock() {
+        let now_empty = if let Ok(mut map) = self.senders.lock() {
             map.remove(&run_id);
+            map.is_empty()
+        } else {
+            false
+        };
+        // The last supervisor just finished: wake the shutdown hook (if it
+        // is waiting) so the server can exit with every process reaped.
+        if now_empty {
+            self.idle.notify_waiters();
+        }
+    }
+
+    /// Resolve when no live supervisor is left. Returns immediately when
+    /// the registry is already empty; otherwise waits for the last
+    /// supervisor to finish (each removal re-checks, so a run that ends
+    /// while waiting is noticed).
+    pub async fn wait_idle(&self) {
+        loop {
+            if self.senders.lock().map(|m| m.is_empty()).unwrap_or(true) {
+                return;
+            }
+            // notify_waiters() only wakes current waiters, so re-check in
+            // a loop; a short sleep bounds the wait if a notification is
+            // missed between the check and the sleep.
+            tokio::select! {
+                _ = self.idle.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
         }
     }
 
@@ -277,6 +363,15 @@ fn resolve_timeout(configured: Option<u64>) -> Option<u64> {
 
 /// Spawn the process for a run and start its supervisor. Used both for
 /// fresh runs (slot was free) and for queued runs picked up later.
+///
+/// **Shutdown safety:** the cancel sender is registered in the registry
+/// *before* the process is spawned, and both happen under the registry's
+/// spawn gate. A shutdown therefore can never miss a run that is mid-spawn:
+/// it either sees the sender (and its cancel is buffered — the supervisor
+/// kills the tree the moment it starts) or the gate refuses the spawn and
+/// no process is created. Without the gate, a run started by an in-flight
+/// request during the shutdown would never be cancelled and the shutdown
+/// would hang (or worse, the process would outlive the server).
 async fn spawn_and_supervise(
     db: SharedDb,
     registry: SharedRegistry,
@@ -318,41 +413,55 @@ async fn spawn_and_supervise(
     if let Some(workdir) = task.workdir.as_deref() {
         command.current_dir(workdir);
     }
+    // Own process group: the direct child is only the `sh -c` wrapper, so a
+    // kill of the child alone would leave the real agent process running.
+    // The group lets kill_tree() take the wrapper and everything it spawned
+    // down in one signal. (On non-Unix there is no process-group API; the
+    // kill falls back to the child alone.)
+    #[cfg(unix)]
+    command.process_group(0);
 
-    let mut child = match command.spawn() {
+    // Register the cancel sender and spawn the process, both under the
+    // gate (no `.await` inside — the guard is not held across one).
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+    let child = {
+        let _gate = match registry.spawn_or_refuse() {
+            Ok(gate) => gate,
+            Err(e) => {
+                // The server is shutting down: no process exists, but the
+                // run row does — it must not dangle as "running".
+                fail_spawn(&db, &registry, &slots, &stream, run_id, agent.id, &e);
+                return Err(e);
+            }
+        };
+        registry.insert(run_id, cancel_tx);
+        command.spawn()
+    };
+    let mut child = match child {
         Ok(child) => child,
         Err(e) => {
-            // The run row already exists; do not leave it dangling as
-            // "running" forever, and free the slot for the next queued run.
-            mark_failed(&db, run_id, &format!("cannot spawn command: {e}"));
-            stream.push(RunEvent::Status("failed".to_string()));
-            stream.push(RunEvent::End);
-            registry.remove_stream(run_id);
-            release_and_pull_next(db.clone(), registry, slots, agent.id);
-            return Err(format!("cannot spawn command: {e}"));
+            // The sender was registered above; without a supervisor it
+            // would hang the shutdown's wait for idle runs, so remove it.
+            registry.remove(run_id);
+            let message = format!("cannot spawn command: {e}");
+            fail_spawn(&db, &registry, &slots, &stream, run_id, agent.id, &message);
+            return Err(message);
         }
     };
 
-    // Feed the prompt on stdin, then close it so agents that read to EOF
-    // (e.g. `cat`) terminate. A write error (typically EPIPE) means the
-    // child exited without reading stdin — a legitimate configuration
-    // (e.g. `true`); the run's outcome is the child's own exit status, so
-    // supervision continues instead of failing the run.
+    // Take stdin out before the supervisor takes ownership of the child.
     let mut stdin = child.stdin.take().expect("stdin was piped");
-    if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-        eprintln!("run {run_id}: agent closed stdin before the prompt was written: {e}");
-    }
-    let _ = stdin.shutdown().await;
-    drop(stdin);
-
-    // 3. Supervise in the background.
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
-    registry.insert(run_id, cancel_tx);
+    // The supervisor is started before the prompt is written so that a
+    // buffered cancellation (a shutdown raced the spawn) kills the tree
+    // even while the write is still in flight — a blocked write on a
+    // full pipe then fails with EPIPE instead of hanging forever.
+    let child_pid = child.id();
     tokio::spawn(supervise(
         db,
         registry,
         slots,
         run_id,
+        child_pid,
         child,
         cancel_rx,
         timeout_secs,
@@ -360,7 +469,39 @@ async fn spawn_and_supervise(
         stream,
     ));
 
+    // Feed the prompt on stdin, then close it so agents that read to EOF
+    // (e.g. `cat`) terminate. A write error (typically EPIPE) means the
+    // child exited without reading stdin — a legitimate configuration
+    // (e.g. `true`); the run's outcome is the child's own exit status, so
+    // supervision continues instead of failing the run.
+    if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+        eprintln!("run {run_id}: agent closed stdin before the prompt was written: {e}");
+    }
+    let _ = stdin.shutdown().await;
+    drop(stdin);
+
     Ok(())
+}
+
+/// Record a spawn-stage failure (spawn error, or a refusal because the
+/// server is shutting down): the run row must not dangle as `running`, the
+/// conversation stream must end, and the agent's slot must be freed for the
+/// next queued run (of which there is none during a shutdown — the queue
+/// was cancelled before the gate closed).
+fn fail_spawn(
+    db: &SharedDb,
+    registry: &SharedRegistry,
+    slots: &std::sync::Arc<AgentSlots>,
+    stream: &std::sync::Arc<RunStream>,
+    run_id: i64,
+    agent_id: i64,
+    message: &str,
+) {
+    mark_failed(db, run_id, message);
+    stream.push(RunEvent::Status("failed".to_string()));
+    stream.push(RunEvent::End);
+    registry.remove_stream(run_id);
+    release_and_pull_next(db.clone(), registry.clone(), slots.clone(), agent_id);
 }
 
 /// Release the agent's slot and start the next queued run for that agent,
@@ -451,6 +592,7 @@ async fn supervise(
     registry: SharedRegistry,
     slots: std::sync::Arc<AgentSlots>,
     run_id: i64,
+    child_pid: Option<u32>,
     mut child: tokio::process::Child,
     mut cancel: mpsc::Receiver<()>,
     timeout_secs: Option<u64>,
@@ -487,7 +629,7 @@ async fn supervise(
     };
 
     if matches!(outcome, Outcome::TimedOut | Outcome::Cancelled) {
-        let _ = child.start_kill();
+        kill_tree(child_pid, &mut child);
     }
 
     // The pipes close when the process dies, so the readers finish on their
@@ -541,6 +683,31 @@ enum Outcome {
     TimedOut,
     Cancelled,
     SpawnError,
+}
+
+/// Kill a run's whole process tree. The direct child is the `sh -c`
+/// wrapper; the real agent is a grandchild it spawned, so killing only the
+/// child would leave the agent running (the bug this fixes). Every run is
+/// spawned in its own process group, so one signal to the group takes the
+/// wrapper, the agent and anything else the command started down together.
+///
+/// `pid` is the wrapper's pid, captured at spawn time (it doubles as the
+/// process-group id). The child is killed as well (not just the group) so
+/// the exit is reaped and the run reaches a final status even on platforms
+/// without process groups, where the group kill is a no-op.
+fn kill_tree(pid: Option<u32>, child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // The child leads its own group (process_group(0) at spawn), so
+        // its pid doubles as the pgid. ESRCH means the group is already
+        // gone — the child exited between the outcome and here; not an
+        // error.
+        // SAFETY: plain kill(2) with a checked pid.
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    }
+    let _ = child.start_kill();
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// Read a stream to EOF, keeping only the last [`MAX_RUN_OUTPUT_BYTES`].
@@ -608,6 +775,29 @@ pub fn fail_orphaned_runs(db: &Db) {
         }
         Err(e) => eprintln!("cannot check for orphaned runs: {e}"),
     }
+}
+
+/// Stop every live run on the way out. Called by the server's graceful
+/// shutdown, after the listener stopped accepting requests.
+///
+/// Agent processes run in their own process groups (see [`kill_tree`]), so
+/// they do not receive the terminal's Ctrl-C — without this call they would
+/// outlive the server. The order matters:
+///
+/// 1. flip queued rows to `cancelled` first — otherwise a supervisor that
+///    releases its slot during the shutdown would pick the next queued run
+///    up and spawn a fresh process on the way out;
+/// 2. then ask every live supervisor to kill its tree. The supervisors
+///    finish asynchronously; the shutdown waits for them (see
+///    [`RunRegistry::wait_idle`]) so the processes are really gone before
+///    the server exits.
+pub async fn shutdown_all(db: SharedDb, registry: SharedRegistry) {
+    if let Ok(guard) = db.lock() {
+        // Best effort: a database error must not block the shutdown.
+        let _ = guard.cancel_queued_runs();
+    }
+    registry.cancel_all();
+    registry.wait_idle().await;
 }
 
 #[cfg(test)]
@@ -839,6 +1029,159 @@ mod tests {
     async fn cancel_of_unknown_run_returns_false() {
         let registry = RunRegistry::default();
         assert!(!registry.cancel(999));
+    }
+
+    // ---------- killing the whole process tree ----------
+
+    /// Is a pid alive? `kill(pid, 0)` probes without sending a signal.
+    #[cfg(unix)]
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks permission/existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Wait until a pid is gone (or panic on timeout). A killed process
+    /// disappears asynchronously, so a single check is not enough.
+    #[cfg(unix)]
+    async fn wait_for_pid_gone(pid: i32) {
+        for _ in 0..200 {
+            if !pid_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("pid {pid} is still alive");
+    }
+
+    /// The regression test for the bug this task fixes: cancelling a run
+    /// must kill the **agent process**, not just the `sh -c` wrapper around
+    /// it. The command backgrounds a `sleep` (the "agent", a grandchild)
+    /// and then `wait`s, so the wrapper stays alive and the run is live —
+    /// but a kill of the child alone would leave the grandchild running.
+    /// After the cancel, the grandchild's pid must be gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_kills_the_agent_process_not_just_the_wrapper() {
+        let (db, registry, slots) = setup();
+        let marker = tree_test_marker();
+        let (task, agent) = seed(&db, &tree_test_command(&marker), None, Some(0));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+        assert_eq!(run.status, "running");
+        let grandchild = wait_for_grandchild_pid(&marker).await;
+        assert!(pid_alive(grandchild), "the grandchild must be alive before the cancel");
+
+        // Cancel: the wrapper is alive, but only the group kill also
+        // reaches the grandchild.
+        assert!(registry.cancel(run.id));
+        let finished = wait_for(&db, run.id, "running").await;
+        assert_eq!(finished.status, "cancelled");
+        wait_for_pid_gone(grandchild).await;
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// Same guarantee for the timeout: a hung agent (a grandchild) must be
+    /// killed when the run times out, not just its `sh -c` wrapper.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_agent_process_not_just_the_wrapper() {
+        let (db, registry, slots) = setup();
+        let marker = tree_test_marker();
+        let (task, agent) = seed(&db, &tree_test_command(&marker), None, Some(1));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+        let grandchild = wait_for_grandchild_pid(&marker).await;
+
+        // The 1 s timeout fires; the group kill must reach the grandchild.
+        let finished = wait_for(&db, run.id, "running").await;
+        assert_eq!(finished.status, "timed_out");
+        wait_for_pid_gone(grandchild).await;
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// A unique marker file path per test invocation, so parallel tests
+    /// never share one.
+    #[cfg(unix)]
+    fn tree_test_marker() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "orga-rs-tree-test-{}-{}.pid",
+            std::process::id(),
+            run_marker_seq()
+        ))
+    }
+
+    /// The command under test: it backgrounds a `sleep 300` (the "agent"
+    /// grandchild), reports that pid to the marker file, then `wait`s —
+    /// the wrapper stays alive (the run is `running`) while the grandchild
+    /// runs. A child-only kill would orphan the grandchild: the reported
+    /// bug.
+    #[cfg(unix)]
+    fn tree_test_command(marker: &std::path::Path) -> String {
+        format!("sleep 300 & echo $! > \"{}\"; wait", marker.to_string_lossy())
+    }
+
+    /// Poll the marker file until the grandchild has reported its pid.
+    #[cfg(unix)]
+    async fn wait_for_grandchild_pid(marker: &std::path::Path) -> i32 {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(marker) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the grandchild never reported its pid");
+    }
+
+    /// The shutdown sweep must kill live runs (their process groups do not
+    /// receive the terminal's Ctrl-C) and must not start queued ones.
+    #[tokio::test]
+    async fn shutdown_all_kills_live_runs_and_cancels_queued_ones() {
+        let (db, registry, slots) = setup();
+        let (task, agent) = seed(&db, "sleep 300", None, Some(0));
+
+        // A live run and a queued run of the same agent.
+        let live = start(db.clone(), registry.clone(), slots.clone(), task.clone(), agent.clone())
+            .await
+            .unwrap();
+        assert_eq!(live.status, "running");
+        let queued = start(db.clone(), registry.clone(), slots.clone(), task.clone(), agent.clone())
+            .await
+            .unwrap();
+        assert_eq!(queued.status, "queued");
+
+        shutdown_all(db.clone(), registry.clone()).await;
+
+        // The live run was killed and recorded as cancelled.
+        let live_row = {
+            let guard = db.lock().unwrap();
+            guard.get_run(live.id).unwrap().unwrap()
+        };
+        assert_eq!(live_row.status, "cancelled");
+        // The queued run was cancelled, not started.
+        let queued_row = {
+            let guard = db.lock().unwrap();
+            guard.get_run(queued.id).unwrap().unwrap()
+        };
+        assert_eq!(queued_row.status, "cancelled");
+        // The registry is idle: every supervisor finished.
+        assert!(registry.senders.lock().unwrap().is_empty());
+        // And the gate is closed: a fresh run is refused, not spawned.
+        let (task2, agent2) = seed(&db, "true", None, Some(5));
+        let refused = start(db.clone(), registry.clone(), slots.clone(), task2, agent2).await;
+        assert!(refused.is_err(), "a run after shutdown must be refused");
+    }
+
+    /// A unique suffix per test invocation, so parallel tests never share
+    /// a marker file.
+    fn run_marker_seq() -> u64 {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     #[tokio::test]
