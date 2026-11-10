@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>orga-rs — Tasks</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #272d3a;
+    --text: #e6e9ef; --muted: #8b93a7; --accent: #4f8cff;
+    --todo: #8b93a7; --progress: #f0ad4e; --done: #3ecf8e;
+    --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { padding: 24px 24px 0; }
+  h1 { margin: 0 0 16px; font-size: 22px; letter-spacing: .5px; }
+  h1 span { color: var(--accent); }
+
+  .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 18px; min-width: 110px;
+  }
+  .stat b { display: block; font-size: 22px; }
+  .stat small { color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .5px; }
+  .stat.alert b { color: var(--danger); }
+
+  main { padding: 0 24px 40px; max-width: 900px; margin: 0 auto; }
+  form, .toolbar, .task {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  }
+  form { padding: 16px; display: grid; gap: 10px; margin-bottom: 16px; }
+  form .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  form .row > * { flex: 1; min-width: 130px; }
+  input, select, textarea, button {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font: inherit;
+  }
+  input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+  textarea { resize: vertical; min-height: 38px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.1); }
+  button.ghost { background: transparent; }
+  button.ghost:hover { border-color: var(--muted); }
+  button.danger { background: transparent; color: var(--danger); border-color: transparent; }
+  button.danger:hover { border-color: var(--danger); }
+  .form-actions { display: flex; gap: 10px; }
+
+  .toolbar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    padding: 10px 16px; margin-bottom: 12px;
+  }
+  .toolbar label { color: var(--muted); font-size: 13px; }
+  .toolbar .count { margin-left: auto; color: var(--muted); font-size: 13px; }
+
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+  .task { padding: 14px 16px; display: flex; gap: 14px; align-items: flex-start; }
+  .task .body { flex: 1; min-width: 0; }
+  .task .title { font-weight: 600; margin: 0 0 2px; overflow-wrap: anywhere; }
+  .task .desc { color: var(--muted); margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .task .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 12px; }
+  .badge {
+    border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600;
+    border: 1px solid var(--border); color: var(--muted); background: var(--bg);
+  }
+  .badge.status-todo { color: var(--todo); }
+  .badge.status-in_progress { color: var(--progress); border-color: var(--progress); }
+  .badge.status-done { color: var(--done); border-color: var(--done); }
+  .badge.prio-high { color: var(--danger); border-color: var(--danger); }
+  .badge.prio-medium { color: var(--progress); }
+  .badge.due { color: var(--muted); }
+  .badge.due.overdue { color: var(--danger); border-color: var(--danger); }
+  .task .actions { display: flex; gap: 6px; }
+  .task.done .title { text-decoration: line-through; color: var(--muted); }
+
+  #empty { color: var(--muted); text-align: center; padding: 30px; }
+  #toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--danger); color: #fff; border-radius: 8px; padding: 10px 18px;
+    font-size: 14px; box-shadow: 0 4px 20px rgba(0,0,0,.5);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>orga<span>-rs</span> · task manager</h1>
+  <div class="stats" id="stats"></div>
+</header>
+<main>
+  <form id="form" autocomplete="off">
+    <input id="title" placeholder="Task title" required maxlength="200">
+    <textarea id="description" placeholder="Description (optional)" rows="2"></textarea>
+    <div class="row">
+      <select id="status">
+        <option value="todo">todo</option>
+        <option value="in_progress">in_progress</option>
+        <option value="done">done</option>
+      </select>
+      <select id="priority">
+        <option value="low">low</option>
+        <option value="medium" selected>medium</option>
+        <option value="high">high</option>
+      </select>
+      <input id="due" type="date">
+    </div>
+    <div class="form-actions">
+      <button class="primary" id="submit" type="submit">Add task</button>
+      <button class="ghost" id="cancel" type="button" hidden>Cancel</button>
+    </div>
+  </form>
+
+  <div class="toolbar">
+    <label>Status
+      <select id="filter-status">
+        <option value="">all</option>
+        <option value="todo">todo</option>
+        <option value="in_progress">in_progress</option>
+        <option value="done">done</option>
+      </select>
+    </label>
+    <label>Priority
+      <select id="filter-priority">
+        <option value="">all</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+    </label>
+    <span class="count" id="count"></span>
+  </div>
+
+  <ul id="list"></ul>
+  <p id="empty" hidden>No tasks match the current filters.</p>
+</main>
+<div id="toast" hidden></div>
+
+<script>
+'use strict';
+
+const $ = (sel) => document.querySelector(sel);
+const state = { status: '', priority: '', editing: null };
+
+// Escape user content before it goes into innerHTML.
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+
+async function api(path, options = {}) {
+  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${res.status}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+async function load() {
+  const params = new URLSearchParams();
+  if (state.status) params.set('status', state.status);
+  if (state.priority) params.set('priority', state.priority);
+  const [tasks, stats] = await Promise.all([
+    api('/api/tasks?' + params.toString()),
+    api('/api/stats'),
+  ]);
+  renderStats(stats);
+  renderList(tasks);
+}
+
+function renderStats(stats) {
+  const cards = [
+    ['total', 'Total', false],
+    ['todo', 'To do', false],
+    ['in_progress', 'In progress', false],
+    ['done', 'Done', false],
+    ['overdue', 'Overdue', stats.overdue > 0],
+  ];
+  $('#stats').innerHTML = cards.map(([key, label, alert]) => `
+    <div class="stat${alert ? ' alert' : ''}">
+      <b>${stats[key]}</b><small>${label}</small>
+    </div>`).join('');
+}
+
+function renderList(tasks) {
+  const list = $('#list');
+  list.innerHTML = '';
+  $('#empty').hidden = tasks.length > 0;
+  $('#count').textContent = `${tasks.length} task${tasks.length === 1 ? '' : 's'}`;
+
+  const today = new Date().toISOString().slice(0, 10);
+  for (const task of tasks) {
+    const li = document.createElement('li');
+    li.className = 'task' + (task.status === 'done' ? ' done' : '');
+    const overdue = task.due_date && task.status !== 'done' && task.due_date < today;
+    li.innerHTML = `
+      <div class="body">
+        <p class="title">${esc(task.title)}</p>
+        ${task.description ? `<p class="desc">${esc(task.description)}</p>` : ''}
+        <div class="meta">
+          <button class="badge status-${esc(task.status)}" data-action="cycle" title="Advance status">
+            ${esc(task.status)}
+          </button>
+          <span class="badge prio-${esc(task.priority)}">${esc(task.priority)}</span>
+          ${task.due_date ? `<span class="badge due${overdue ? ' overdue' : ''}">due ${esc(task.due_date)}</span>` : ''}
+        </div>
+      </div>
+      <div class="actions">
+        <button class="ghost" data-action="edit">Edit</button>
+        <button class="danger" data-action="delete">Delete</button>
+      </div>`;
+    li.querySelector('[data-action="cycle"]').addEventListener('click', () => cycleStatus(task));
+    li.querySelector('[data-action="edit"]').addEventListener('click', () => startEdit(task));
+    li.querySelector('[data-action="delete"]').addEventListener('click', () => removeTask(task));
+    list.appendChild(li);
+  }
+}
+
+async function cycleStatus(task) {
+  const next = { todo: 'in_progress', in_progress: 'done', done: 'todo' }[task.status] || 'todo';
+  try {
+    await api(`/api/tasks/${task.id}`, { method: 'PUT', body: JSON.stringify({ status: next }) });
+    await load();
+  } catch (err) { toast(err.message); }
+}
+
+function startEdit(task) {
+  state.editing = task.id;
+  $('#title').value = task.title;
+  $('#description').value = task.description;
+  $('#status').value = task.status;
+  $('#priority').value = task.priority;
+  $('#due').value = task.due_date || '';
+  $('#submit').textContent = 'Save changes';
+  $('#cancel').hidden = false;
+  $('#title').focus();
+}
+
+function stopEditing() {
+  state.editing = null;
+  $('#form').reset();
+  $('#submit').textContent = 'Add task';
+  $('#cancel').hidden = true;
+}
+
+async function removeTask(task) {
+  if (!confirm(`Delete "${task.title}"?`)) return;
+  try {
+    await api(`/api/tasks/${task.id}`, { method: 'DELETE' });
+    if (state.editing === task.id) stopEditing();
+    await load();
+  } catch (err) { toast(err.message); }
+}
+
+$('#form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  // When editing, an emptied date field must clear the due date: the API
+  // treats "" as "clear" and a missing/null field as "keep current value".
+  const due = $('#due').value || (state.editing ? '' : null);
+  const payload = {
+    title: $('#title').value,
+    description: $('#description').value,
+    status: $('#status').value,
+    priority: $('#priority').value,
+    due_date: due,
+  };
+  try {
+    if (state.editing) {
+      await api(`/api/tasks/${state.editing}`, { method: 'PUT', body: JSON.stringify(payload) });
+    } else {
+      await api('/api/tasks', { method: 'POST', body: JSON.stringify(payload) });
+    }
+    stopEditing();
+    await load();
+  } catch (err) { toast(err.message); }
+});
+
+$('#cancel').addEventListener('click', stopEditing);
+$('#filter-status').addEventListener('change', (e) => { state.status = e.target.value; load(); });
+$('#filter-priority').addEventListener('change', (e) => { state.priority = e.target.value; load(); });
+
+let toastTimer;
+function toast(message) {
+  const el = $('#toast');
+  el.textContent = message;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
+load();
+</script>
+</body>
+</html>
