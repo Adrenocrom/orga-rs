@@ -117,7 +117,7 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         )
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/stream", get(stream_run))
-        .route("/api/workdirs", get(list_workdirs))
+        .route("/api/workdirs", get(list_workdirs).post(add_workdir).delete(remove_workdir))
         .route("/api/stats", get(get_stats))
         .route_layer(middleware::from_fn_with_state(token, require_token))
         .with_state(state);
@@ -421,6 +421,50 @@ async fn list_workdirs(
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
+        )
+            .into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkdirEntryBody {
+    workdir: String,
+}
+
+/// Add a directory to the workdirs config (see [`crate::workdirs`]).
+/// The path must be absolute; adding an existing entry is a no-op. The
+/// config file is created when it does not exist yet. Returns the updated
+/// list — the same shape `GET /api/workdirs` serves.
+async fn add_workdir(
+    State(state): State<AppState>,
+    Json(input): Json<WorkdirEntryBody>,
+) -> Result<(StatusCode, Json<Vec<String>>), axum::response::Response> {
+    match crate::workdirs::add(&state.workdirs, &input.workdir) {
+        Ok(dirs) => Ok((StatusCode::CREATED, Json(dirs))),
+        Err(crate::workdirs::ConfigError::Invalid(msg)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": msg })),
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response()),
+    }
+}
+
+/// Remove a directory from the workdirs config. Removing an entry that is
+/// not in the list is a no-op (idempotent). Returns the updated list.
+async fn remove_workdir(
+    State(state): State<AppState>,
+    Query(input): Query<WorkdirEntryBody>,
+) -> Result<Json<Vec<String>>, axum::response::Response> {
+    match crate::workdirs::remove(&state.workdirs, &input.workdir) {
+        Ok(dirs) => Ok(Json(dirs)),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
         )
             .into_response()),
     }
@@ -757,6 +801,11 @@ mod tests {
         // <details>, collapsed by default, state kept across re-renders).
         assert!(html.contains("details class=\"run-output\""));
         assert!(html.contains("expandedRuns"));
+        // The projects section manages the workdirs config (add/remove).
+        assert!(html.contains("id=\"projects-section\""));
+        assert!(html.contains("renderProjects"));
+        assert!(html.contains("addProject"));
+        assert!(html.contains("removeProject"));
     }
 
     /// The dashboard's script block must stay syntactically balanced. A
@@ -1389,6 +1438,86 @@ mod tests {
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_json(res).await;
         assert!(body["error"].as_str().unwrap().contains("not valid JSON"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn workdirs_can_be_added_and_removed_via_the_api() {
+        let path = workdirs_test_path();
+        let app = app_with(None, path.clone());
+
+        // POST adds an entry (and creates the config file on the way).
+        let res = call(
+            &app,
+            "POST",
+            "/api/workdirs",
+            Some(r#"{"workdir":"/tmp/project-a"}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(body_json(res).await, serde_json::json!(["/tmp/project-a"]));
+
+        // A duplicate add is a no-op that returns the unchanged list.
+        let res = call(
+            &app,
+            "POST",
+            "/api/workdirs",
+            Some(r#"{"workdir":"/tmp/project-a"}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(body_json(res).await, serde_json::json!(["/tmp/project-a"]));
+
+        // A relative path is rejected with 400 and nothing is written.
+        let res = call(
+            &app,
+            "POST",
+            "/api/workdirs",
+            Some(r#"{"workdir":"relative"}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(res).await["error"].as_str().unwrap().contains("absolute"));
+
+        // The list endpoint serves the same state (the file is the truth).
+        let res = call(&app, "GET", "/api/workdirs", None).await;
+        assert_eq!(body_json(res).await, serde_json::json!(["/tmp/project-a"]));
+
+        // DELETE removes an entry; the response is the updated list.
+        let res = call(&app, "DELETE", "/api/workdirs?workdir=/tmp/project-a", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, serde_json::json!([]));
+
+        // Removing an entry that is not in the list is a no-op.
+        let res = call(&app, "DELETE", "/api/workdirs?workdir=/tmp/gone", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, serde_json::json!([]));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn workdir_mutations_survive_a_malformed_config_check() {
+        let path = workdirs_test_path();
+        let app = app_with(None, path.clone());
+
+        // A malformed config blocks mutations (500 with the reason) and is
+        // left untouched — the user must fix the file by hand.
+        std::fs::write(&path, "{not json").unwrap();
+        let res = call(
+            &app,
+            "POST",
+            "/api/workdirs",
+            Some(r#"{"workdir":"/tmp/x"}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_json(res).await["error"].as_str().unwrap().contains("not valid JSON"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+
+        let res = call(&app, "DELETE", "/api/workdirs?workdir=/tmp/x", None).await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_json(res).await["error"].as_str().unwrap().contains("not valid JSON"));
         let _ = std::fs::remove_file(&path);
     }
 

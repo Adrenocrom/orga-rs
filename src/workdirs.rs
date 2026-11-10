@@ -8,7 +8,8 @@
 //! ```
 //!
 //! The file is re-read on every request, so editing it applies without a
-//! restart. Error policy:
+//! restart — including edits made through the API ([`add`] / [`remove`]),
+//! which rewrite the same file. Error policy:
 //!
 //! - a **missing** file is an empty list — the feature is optional and a
 //!   fresh install has no config yet;
@@ -35,6 +36,55 @@ pub fn load(path: &Path) -> Result<Vec<String>, String> {
         }
     };
     parse(&text, path)
+}
+
+/// Add a directory to the config. The path is validated (absolute, within
+/// the length limit) and trimmed; adding an existing entry is a no-op that
+/// keeps its position. A missing config file is treated as an empty list,
+/// so the first add creates the file.
+pub fn add(path: &Path, dir: &str) -> Result<Vec<String>, ConfigError> {
+    let dir = dir.trim();
+    check_workdir(Some(dir)).map_err(ConfigError::Invalid)?;
+    let mut dirs = load(path).map_err(ConfigError::Load)?;
+    if !dirs.iter().any(|d| d == dir) {
+        dirs.push(dir.to_string());
+        save(path, &dirs)?;
+    }
+    Ok(dirs)
+}
+
+/// Remove a directory from the config. The path is trimmed and compared
+/// literally (no canonicalization — the config stores what the user
+/// entered). Removing an entry that is not in the list is a no-op.
+pub fn remove(path: &Path, dir: &str) -> Result<Vec<String>, ConfigError> {
+    let dir = dir.trim();
+    let mut dirs = load(path).map_err(ConfigError::Load)?;
+    let before = dirs.len();
+    dirs.retain(|d| d != dir);
+    if dirs.len() != before {
+        save(path, &dirs)?;
+    }
+    Ok(dirs)
+}
+
+/// Write the list back as a JSON array, creating the parent directory on
+/// the way (the default `~/.config/orga` exists after `serve` created the
+/// database there, but `ORGA_WORKDIRS` may point anywhere).
+fn save(path: &Path, dirs: &[String]) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ConfigError::Save(format!(
+                    "cannot create directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    let text = serde_json::to_string_pretty(dirs).map_err(|e| ConfigError::Save(e.to_string()))?;
+    std::fs::write(path, text).map_err(|e| {
+        ConfigError::Save(format!("cannot write workdirs config {}: {e}", path.display()))
+    })
 }
 
 /// Parse the config text. Split from [`load`] so the rules are testable
@@ -77,6 +127,25 @@ fn parse(text: &str, path: &Path) -> Result<Vec<String>, String> {
         }
     }
     Ok(dirs)
+}
+
+/// Failure of a config mutation ([`add`] / [`remove`]): either the input is
+/// invalid (a relative path — the caller's fault, a 400), or the config
+/// cannot be read or written (the file's fault, a 500 with the reason).
+#[derive(Debug)]
+pub enum ConfigError {
+    Invalid(String),
+    Load(String),
+    Save(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Invalid(msg) => write!(f, "{msg}"),
+            ConfigError::Load(msg) | ConfigError::Save(msg) => write!(f, "{msg}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +196,92 @@ mod tests {
         let dirs = load(&path).unwrap();
         assert_eq!(dirs, vec!["/tmp/one"]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A unique config path per test, so tests never share state.
+    fn test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "orga-rs-workdirs-mutate-{}-{name}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn add_appends_validates_and_creates_the_file() {
+        let path = test_path("add");
+
+        // No config file yet: the first add creates it.
+        let dirs = add(&path, "/tmp/project-a").unwrap();
+        assert_eq!(dirs, vec!["/tmp/project-a"]);
+        assert_eq!(load(&path).unwrap(), vec!["/tmp/project-a"]);
+
+        // A second entry is appended; duplicates keep their position.
+        let dirs = add(&path, "/tmp/project-b").unwrap();
+        assert_eq!(dirs, vec!["/tmp/project-a", "/tmp/project-b"]);
+        let dirs = add(&path, "/tmp/project-a").unwrap();
+        assert_eq!(dirs, vec!["/tmp/project-a", "/tmp/project-b"]);
+
+        // The path is trimmed before it is stored.
+        let dirs = add(&path, "  /tmp/project-c  ").unwrap();
+        assert_eq!(dirs.last().unwrap(), "/tmp/project-c");
+
+        // Relative paths are rejected before anything is written.
+        let err = add(&path, "relative").unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)));
+        assert!(err.to_string().contains("absolute"), "{err}");
+        assert_eq!(load(&path).unwrap().len(), 3);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_deletes_the_entry_and_tolerates_unknown_paths() {
+        let path = test_path("remove");
+        std::fs::write(&path, r#"["/tmp/a", "/tmp/b"]"#).unwrap();
+
+        let dirs = remove(&path, "/tmp/a").unwrap();
+        assert_eq!(dirs, vec!["/tmp/b"]);
+        assert_eq!(load(&path).unwrap(), vec!["/tmp/b"]);
+
+        // Removing an entry that is not in the list is a no-op (the file
+        // is not rewritten).
+        let dirs = remove(&path, "/tmp/never-existed").unwrap();
+        assert_eq!(dirs, vec!["/tmp/b"]);
+
+        // Removing the last entry leaves an empty array in the file.
+        let dirs = remove(&path, "/tmp/b").unwrap();
+        assert!(dirs.is_empty());
+        assert_eq!(load(&path).unwrap(), Vec::<String>::new());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn add_fails_on_a_malformed_config_without_touching_it() {
+        let path = test_path("malformed");
+        std::fs::write(&path, "{not json").unwrap();
+        let err = add(&path, "/tmp/x").unwrap_err();
+        assert!(matches!(err, ConfigError::Load(_)));
+        assert!(err.to_string().contains("not valid JSON"), "{err}");
+        // The malformed file is left exactly as it was.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn add_creates_missing_parent_directories() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir()
+            .join(format!(
+                "orga-rs-workdirs-nested-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+            .join("deep")
+            .join("workdirs.json");
+        let dirs = add(&path, "/tmp/x").unwrap();
+        assert_eq!(dirs, vec!["/tmp/x"]);
+        assert_eq!(load(&path).unwrap(), vec!["/tmp/x"]);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 }

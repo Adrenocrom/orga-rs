@@ -155,7 +155,19 @@
     padding: 8px 2px; user-select: none;
   }
   details > summary:hover { color: var(--text); }
-  #agents-section .section-actions { margin: 10px 0 12px; }
+  #projects-section .section-actions, #agents-section .section-actions { margin: 10px 0 12px; }
+  #projects-section .section-actions { display: flex; gap: 10px; }
+  #projects-section .section-actions input { flex: 1; }
+  .project-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 16px; margin-bottom: 8px;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  }
+  .project-card .path {
+    font: 13px/1.5 ui-monospace, "Cascadia Code", monospace;
+    overflow-wrap: anywhere; flex: 1; min-width: 200px;
+  }
+  .project-card .actions { display: flex; gap: 6px; }
   #agent-form .row code {
     color: var(--muted); font-size: 12px; overflow-wrap: anywhere;
   }
@@ -324,6 +336,16 @@
     </form>
   </dialog>
 
+  <details id="projects-section">
+    <summary>Projects — directories offered as task workdirs</summary>
+    <div class="section-actions">
+      <input id="project-input" placeholder="Absolute path, e.g. /home/me/project" maxlength="1024">
+      <button class="primary" id="add-project">+ Add project</button>
+    </div>
+    <ul id="project-list"></ul>
+    <p id="projects-empty" hidden>No project directories configured yet — add one above.</p>
+  </details>
+
   <details id="agents-section">
     <summary>Agents — configure commands that can work on tasks</summary>
     <div class="section-actions">
@@ -441,6 +463,7 @@ async function load() {
     state.runs = runs;
     renderList();
     renderDetail();
+    renderProjects();
     renderAgents();
     renderRuns();
     schedulePolling();
@@ -662,6 +685,62 @@ $('#workdir').addEventListener('change', () => {
     custom.value = '';
     custom.focus();
   }
+});
+
+// ---------- projects (workdirs config) ----------
+
+// The configured project directories (workdirs.json) — the same list the
+// task dialog's workdir dropdown is built from. Managed here: add a path,
+// remove it again. The config file is re-read on every request, so the
+// dropdown picks changes up on the next load().
+function renderProjects() {
+  const list = $('#project-list');
+  list.innerHTML = '';
+  $('#projects-empty').hidden = state.workdirs.length > 0;
+
+  for (const dir of state.workdirs) {
+    const li = document.createElement('li');
+    li.className = 'project-card';
+    li.innerHTML = `
+      <span class="path">📁 ${esc(dir)}</span>
+      <span class="actions">
+        <button class="ghost" data-action="copy-project" title="Copy the path to the clipboard">Copy</button>
+        <button class="danger" data-action="remove-project">Remove</button>
+      </span>`;
+    li.querySelector('[data-action="copy-project"]').addEventListener('click', () => {
+      navigator.clipboard?.writeText(dir).then(() => toast('Path copied'), () => {});
+    });
+    li.querySelector('[data-action="remove-project"]').addEventListener('click', () => removeProject(dir));
+    list.appendChild(li);
+  }
+}
+
+async function addProject() {
+  const input = $('#project-input');
+  const dir = input.value.trim();
+  if (!dir) { input.focus(); return; }
+  try {
+    state.workdirs = await api('/api/workdirs', {
+      method: 'POST',
+      body: JSON.stringify({ workdir: dir }),
+    });
+    input.value = '';
+    renderProjects();
+    toast('Project added');
+  } catch (err) { toast(err.message); }
+}
+
+async function removeProject(dir) {
+  if (!confirm(`Remove "${dir}" from the project list? Tasks using it keep their workdir.`)) return;
+  try {
+    state.workdirs = await api(`/api/workdirs?workdir=${encodeURIComponent(dir)}`, { method: 'DELETE' });
+    renderProjects();
+  } catch (err) { toast(err.message); }
+}
+
+$('#add-project').addEventListener('click', addProject);
+$('#project-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); addProject(); }
 });
 
 // ---------- add/edit task dialog ----------

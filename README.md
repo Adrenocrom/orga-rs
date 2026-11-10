@@ -72,6 +72,9 @@ JavaScript framework) that talks to the REST API:
   description field is generously sized by default
 - optional **workdir** per task — the directory its agent runs execute in,
   picked from the configured list (see below) or entered as a custom path
+- **Projects section**: manage the configured project directories (the
+  workdirs config) — add a path, remove it again; the task dialog's workdir
+  dropdown follows automatically
 - **Agents section**: configure agents (name, command, optional prompt
   template, optional timeout) in an add/edit dialog, edit and delete them
 - per task: pick an agent from the dropdown and press **▶ Run agent** — the
@@ -162,6 +165,22 @@ with a log line. A missing file means an empty list; a malformed file is
 reported as an error (`GET /api/workdirs` → 500 with the reason) instead
 of silently hiding your configuration.
 
+The list can also be managed without editing the file by hand:
+
+- **Dashboard**: the **Projects** section (below the task list) lists the
+  configured directories with an input to add a path and a Remove button
+  per entry.
+- **REST API**: `POST /api/workdirs` (`{"workdir": "/abs/path"}`) adds an
+  entry (idempotent — adding an existing entry is a no-op), `DELETE
+  /api/workdirs?workdir=/abs/path` removes one (a no-op when the entry is
+  not in the list). Both return the updated list and create the config
+  file when it does not exist yet. A relative path is rejected with `400`.
+- **MCP tools**: `add_workdir` / `remove_workdir` do the same for LLM
+  clients.
+
+Removing a directory only changes the offered list — tasks that already
+use the path keep their workdir.
+
 **Security note:** the command runs through `sh -c`, so you can use pipes
 and arguments — but the task content travels only via stdin, never on the
 command line. A task title can never inject shell syntax. The command
@@ -196,6 +215,8 @@ Runs whose server died mid-flight are marked `failed` at the next startup
 | `POST`   | `/api/runs/{id}/cancel`       | cancel a live run (409 if not live)      |
 | `DELETE` | `/api/runs/{id}`              | delete a run (stops it first if live)    |
 | `GET`    | `/api/workdirs`               | configured working directories          |
+| `POST`   | `/api/workdirs`               | add one (`{"workdir": "/abs/path"}`), returns the updated list |
+| `DELETE` | `/api/workdirs?workdir=/abs/path` | remove one (no-op when absent), returns the updated list |
 | `GET`    | `/api/stats`                  | counters incl. overdue                   |
 
 Task fields: `title` (required, 1–200 characters), `description`, `status`
@@ -221,18 +242,19 @@ execution slot is taken; the run starts automatically when the slot frees.
 ## MCP tools
 
 The `mcp` subcommand speaks JSON-RPC 2.0 over stdio (MCP revision 2025-06-18)
-and exposes twelve tools: `list_tasks`, `get_task`, `create_task`,
+and exposes fourteen tools: `list_tasks`, `get_task`, `create_task`,
 `update_task`, `delete_task`, `task_stats`, `list_agents`, `list_workdirs`,
-`run_task`, `get_run`, `list_runs`, `delete_run`.
+`add_workdir`, `remove_workdir`, `run_task`, `get_run`, `list_runs`,
+`delete_run`.
 Tool-level failures (unknown id, invalid enum, server unreachable) are
 returned as `isError: true` results so the model can read and correct them.
 
 Agents are **user-configured** (dashboard or REST API) — the model can list
 and spawn them, but not create or edit them. `run_task` returns immediately
-with the run record; the model polls `get_run` for the outcome. The same
-goes for the workdirs list: `list_workdirs` returns the user-maintained
-config so the model can pick a valid workdir, but the list itself is not
-editable through the tools.
+with the run record; the model polls `get_run` for the outcome. The
+workdirs list is managed with `add_workdir`/`remove_workdir` (or the
+dashboard); `list_workdirs` returns it so the model can pick a valid
+workdir.
 
 **The MCP bridge requires a running server.** Start `orga-rs serve` first,
 then register the bridge in any stdio MCP client (Claude Desktop, etc.):

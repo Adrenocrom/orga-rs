@@ -109,7 +109,8 @@ string to clear it. Use task_stats for a quick summary. Configured agents (list_
 can be spawned on a task with run_task; they work in the background — poll get_run \
 for the outcome. Each agent runs one task at a time; further runs are queued and start \
 automatically. A task's optional workdir is the directory the agent executes in; \
-list_workdirs returns the user-configured directories to pick from."
+list_workdirs returns the configured directories to pick from, and add_workdir/\
+remove_workdir manage that list."
     })
 }
 
@@ -142,6 +143,8 @@ fn call_tool(api: &Api, params: &Value) -> Result<Value, Value> {
         "task_stats" => tool_task_stats(api),
         "list_agents" => tool_list_agents(api),
         "list_workdirs" => tool_list_workdirs(api),
+        "add_workdir" => tool_add_workdir(api, &args),
+        "remove_workdir" => tool_remove_workdir(api, &args),
         "run_task" => tool_run_task(api, &args),
         "get_run" => tool_get_run(api, &args),
         "list_runs" => tool_list_runs(api, &args),
@@ -297,6 +300,52 @@ maintained by the user; a task's workdir can also be set directly."
         "{} configured working director{}:",
         arr.len(),
         if arr.len() == 1 { "y" } else { "ies" }
+    )];
+    for dir in arr {
+        lines.push(dir.as_str().unwrap_or_default().to_string());
+    }
+    Ok(ToolOutput::text(lines.join("\n")))
+}
+
+/// Add a directory to the workdirs config. The path must be absolute;
+/// adding an existing entry is a no-op. Returns the updated list.
+fn tool_add_workdir(api: &Api, args: &Value) -> ToolResult {
+    let dir = req_workdir(args)?;
+    let dirs = api.post_json("/api/workdirs", &json!({ "workdir": dir }), "add workdir")?;
+    workdir_list_text(&dirs, "Added", &dir)
+}
+
+/// Remove a directory from the workdirs config. Removing an entry that is
+/// not in the list is a no-op. Returns the updated list.
+fn tool_remove_workdir(api: &Api, args: &Value) -> ToolResult {
+    let dir = req_workdir(args)?;
+    let dirs = api.delete(
+        &format!("/api/workdirs?workdir={}", urlencode(&dir)),
+        "remove workdir",
+    )?;
+    workdir_list_text(&dirs, "Removed", &dir)
+}
+
+/// The `workdir` argument shared by add_workdir/remove_workdir: a required,
+/// non-empty string (the server validates that it is absolute).
+fn req_workdir(args: &Value) -> Result<String, String> {
+    match opt_string(args, "workdir")? {
+        Some(s) if !s.trim().is_empty() => Ok(s),
+        Some(_) => Err("workdir must not be empty".to_string()),
+        None => Err("missing required argument: workdir".to_string()),
+    }
+}
+
+/// Render the updated workdirs list after a mutation, e.g.
+/// `Added /tmp/x. 3 configured working directories:\n…`.
+fn workdir_list_text(dirs: &Value, verb: &str, dir: &str) -> ToolResult {
+    let Some(arr) = dirs.as_array() else {
+        return Err("server returned an unexpected response".to_string());
+    };
+    let mut lines = vec![format!(
+        "{verb} {dir}. {} configured working director{}:",
+        arr.len(),
+        if arr.len() == 1 { "y" } else { "ies" },
     )];
     for dir in arr {
         lines.push(dir.as_str().unwrap_or_default().to_string());
@@ -668,9 +717,45 @@ through this tool.",
             "description": "List the configured working directories the user \
 maintains in the workdirs config file (~/.config/orga/workdirs.json). Use one \
 of these paths when setting a task's workdir (create_task/update_task) so the \
-agent executes in the right project directory. The list is user-maintained and \
-read-only for the model.",
+agent executes in the right project directory. The list can be managed with \
+add_workdir/remove_workdir.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "add_workdir",
+            "description": "Add a project directory to the workdirs config so \
+it appears in list_workdirs and the dashboard's workdir dropdown. The path \
+must be absolute; adding an existing entry is a no-op. Returns the updated \
+list.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workdir": {
+                        "type": "string",
+                        "description": "Absolute path to add, e.g. /home/me/project.",
+                        "pattern": "^/.+$"
+                    }
+                },
+                "required": ["workdir"]
+            }
+        },
+        {
+            "name": "remove_workdir",
+            "description": "Remove a project directory from the workdirs \
+config. Removing an entry that is not in the list is a no-op. Tasks already \
+using the path keep their workdir; only the offered list changes. Returns \
+the updated list.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workdir": {
+                        "type": "string",
+                        "description": "Absolute path to remove.",
+                        "pattern": "^/.+$"
+                    }
+                },
+                "required": ["workdir"]
+            }
         },
         {
             "name": "run_task",
@@ -833,6 +918,8 @@ mod tests {
 
     /// Spin up the real axum router on an ephemeral port and point the MCP
     /// bridge at it — a true end-to-end test of the HTTP path.
+    static WORKDIRS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn spawn_server() -> (Api, u16) {
         let db: crate::db::SharedDb = std::sync::Arc::new(std::sync::Mutex::new(
             crate::db::Db::open(":memory:").unwrap(),
@@ -841,8 +928,14 @@ mod tests {
             db,
             registry: std::sync::Arc::new(crate::runner::RunRegistry::default()),
             slots: std::sync::Arc::new(crate::runner::AgentSlots::default()),
-            // No config file exists at this path -> an empty workdirs list.
-            workdirs: std::env::temp_dir().join("orga-rs-workdirs-mcptest.json"),
+            // A unique config path per server: no file exists there, so the
+            // workdirs list starts empty, and tests that mutate it never
+            // share state.
+            workdirs: std::env::temp_dir().join(format!(
+                "orga-rs-workdirs-mcptest-{}-{}.json",
+                std::process::id(),
+                WORKDIRS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )),
         };
         let app = crate::web::router(state, None);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -894,7 +987,7 @@ mod tests {
         assert!(responses[0]["result"]["instructions"].as_str().unwrap().contains("YYYY-MM-DD"));
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 14);
         let stats_tool = tools.iter().find(|t| t["name"] == "task_stats").unwrap();
         assert!(stats_tool["outputSchema"].is_object());
 
@@ -1043,6 +1136,59 @@ mod tests {
         let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("No working directories configured"), "{text}");
         assert!(text.contains("workdirs.json"), "{text}");
+    }
+
+    #[test]
+    fn stdio_workdirs_can_be_added_and_removed() {
+        let (api, _port) = spawn_server();
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add_workdir","arguments":{"workdir":"/tmp/project-a"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add_workdir","arguments":{"workdir":"/tmp/project-b"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add_workdir","arguments":{"workdir":"/tmp/project-a"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_workdirs","arguments":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"remove_workdir","arguments":{"workdir":"/tmp/project-a"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"remove_workdir","arguments":{"workdir":"/tmp/never-existed"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"add_workdir","arguments":{"workdir":"relative"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"add_workdir","arguments":{}}}"#, "\n",
+        );
+        let responses = session(&api, input);
+
+        // add returns the updated list
+        assert_eq!(responses[0]["result"]["isError"], false);
+        let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Added"), "{text}");
+        assert!(text.contains("/tmp/project-a"), "{text}");
+
+        // a duplicate add is a no-op: the list still has both entries
+        let text = responses[2]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("/tmp/project-a"), "{text}");
+        assert!(text.contains("/tmp/project-b"), "{text}");
+
+        // list shows both
+        let text = responses[3]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("/tmp/project-a"), "{text}");
+        assert!(text.contains("/tmp/project-b"), "{text}");
+
+        // remove drops the entry (the confirmation line names the removed
+        // path; the list below it must no longer contain it)
+        let text = responses[4]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Removed"), "{text}");
+        let list = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+        assert!(!list.contains("/tmp/project-a"), "{text}");
+        assert!(list.contains("/tmp/project-b"), "{text}");
+
+        // removing an unknown entry is a no-op, not an error
+        assert_eq!(responses[5]["result"]["isError"], false);
+
+        // a relative path is rejected by the server with a clear message
+        assert_eq!(responses[6]["result"]["isError"], true);
+        let text = responses[6]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("absolute"), "{text}");
+
+        // a missing workdir argument is rejected before the round-trip
+        assert_eq!(responses[7]["result"]["isError"], true);
+        let text = responses[7]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("missing required argument: workdir"), "{text}");
     }
 
     #[test]
