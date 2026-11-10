@@ -275,7 +275,7 @@
       <input id="agent-command" placeholder="Command (e.g. my-agent --model x)" required maxlength="2000">
       <textarea id="agent-prompt" placeholder="Prompt template (optional) — placeholders: {id} {title} {description} {status} {priority} {due_date}" rows="4" maxlength="2000"></textarea>
       <div class="row">
-        <input id="agent-timeout" type="number" min="0" max="86400" placeholder="Timeout seconds (optional, 0 = none)">
+        <input id="agent-timeout" type="number" min="0" max="86400" placeholder="Timeout seconds (optional, empty = none)">
       </div>
       <div class="form-actions">
         <button class="primary" id="agent-submit" type="submit">Add agent</button>
@@ -664,9 +664,12 @@ $('#agent-form').addEventListener('submit', async (e) => {
     name: $('#agent-name').value,
     command: $('#agent-command').value,
     prompt_template: $('#agent-prompt').value || null,
-    // An empty field means "use the default" (null); an explicit 0 is a
-    // real value meaning "no timeout" and must survive the round-trip.
-    timeout_secs: $('#agent-timeout').value === '' ? null : Number($('#agent-timeout').value),
+    // An empty field means "no timeout": null on create (the default),
+    // an explicit 0 while editing — the API treats null as "keep the
+    // current value", so clearing the field must send the real value 0.
+    timeout_secs: $('#agent-timeout').value === ''
+      ? (state.agentEditing ? 0 : null)
+      : Number($('#agent-timeout').value),
   };
   try {
     if (state.agentEditing) {
