@@ -10,8 +10,24 @@ use std::sync::{Arc, Mutex};
 use db::{Db, SharedDb};
 
 /// Database file, overridable so several instances can coexist.
+///
+/// Defaults to `~/.config/orga/tasks.db` — one stable location regardless of
+/// the working directory `serve` was started from; the directory is created
+/// on first start. An empty `ORGA_DB` counts as unset: an empty filename
+/// would make SQLite silently use a throwaway temporary database.
 fn db_path() -> String {
-    std::env::var("ORGA_DB").unwrap_or_else(|_| "tasks.db".to_string())
+    match std::env::var("ORGA_DB") {
+        Ok(path) if !path.trim().is_empty() => path,
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| {
+                panic!("ORGA_DB is unset and $HOME is not set: cannot locate the default database")
+            });
+            let dir = std::path::Path::new(&home).join(".config").join("orga");
+            std::fs::create_dir_all(&dir)
+                .unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
+            dir.join("tasks.db").to_string_lossy().into_owned()
+        }
+    }
 }
 
 /// Optional bearer token: when set, the API only answers requests that
@@ -26,11 +42,11 @@ fn api_token() -> Option<String> {
 const USAGE: &str = "\
 usage: orga-rs [serve [ADDR]] | mcp
 
-  serve: web dashboard + REST API (owns the database; ORGA_DB, default tasks.db)
+  serve: web dashboard + REST API (owns the database; ORGA_DB, default ~/.config/orga/tasks.db)
   mcp:    MCP stdio bridge to a running server (ORGA_URL, default http://127.0.0.1:3000)
 
 environment:
-  ORGA_DB     database file for `serve` (default: tasks.db)
+  ORGA_DB     database file for `serve` (default: ~/.config/orga/tasks.db)
   ORGA_URL    base URL of the server for `mcp` (default: http://127.0.0.1:3000)
   ORGA_TOKEN  when set, `serve` requires 'Authorization: Bearer <token>' on
               every API request and `mcp` sends it along";

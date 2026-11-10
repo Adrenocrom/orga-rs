@@ -524,6 +524,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_prompt_travels_on_stdin_never_on_the_command_line() {
+        let (db, registry, slots) = setup();
+        // The command ignores its arguments entirely: if the prompt were
+        // passed on the command line, the output would be empty.
+        let (task, agent) = seed(&db, "cat", Some("PROMPT {title}"), Some(5));
+
+        let run = start(db.clone(), registry.clone(), slots.clone(), task, agent)
+            .await
+            .unwrap();
+        let finished = wait_for(&db, run.id, "running").await;
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.output, "PROMPT say hi");
+    }
+
+    #[tokio::test]
     async fn failing_command_is_recorded_as_failed() {
         let (db, registry, slots) = setup();
         let (task, agent) = seed(&db, "echo boom >&2; exit 3", None, Some(5));

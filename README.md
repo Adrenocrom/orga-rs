@@ -9,7 +9,7 @@ spawned to work on a task. One binary, two modes, one database file.
 ```
         browser ──► HTTP ──┐
                           ┌┴──────────────┐
-   scripts / apps ──► HTTP │ orga-rs serve │──► tasks.db (SQLite)
+   scripts / apps ──► HTTP │ orga-rs serve │──► ~/.config/orga/tasks.db
                           └┬──────────────┘
    LLM client ──► stdio ──►│ orga-rs mcp   │
    (MCP)                   └─── HTTP ─────┘
@@ -32,8 +32,9 @@ cargo run -- serve 0.0.0.0:8080   # custom address
 cargo run -- mcp         # MCP stdio bridge (needs a running server)
 ```
 
-The database file defaults to `tasks.db` in the working directory; override
-with the `ORGA_DB` environment variable. The MCP bridge connects to
+The database file defaults to `~/.config/orga/tasks.db` (the directory is
+created on first start); override with the `ORGA_DB` environment variable.
+The MCP bridge connects to
 `http://127.0.0.1:3000` by default; override with `ORGA_URL` (e.g. when the
 server runs on another machine or port).
 
@@ -60,6 +61,8 @@ server stops accepting connections and lets in-flight requests finish.
 Open http://127.0.0.1:3000 — a single-page dashboard (no build step, no
 JavaScript framework) that talks to the REST API:
 
+- **+ Add task** opens a dialog for creating a task; **Edit** reuses the same
+  dialog (Esc or Cancel discards the changes)
 - create / edit / delete tasks, filter by status and priority
 - click a task's status badge to cycle todo → in_progress → done
 - stat cards for total / todo / in progress / done / overdue

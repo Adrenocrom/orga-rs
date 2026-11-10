@@ -51,6 +51,17 @@
   button.danger:hover { border-color: var(--danger); }
   .form-actions { display: flex; gap: 10px; }
 
+  /* add/edit task dialog (native <dialog>, opened via showModal) */
+  dialog {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; width: min(560px, calc(100vw - 48px));
+    box-shadow: 0 12px 40px rgba(0,0,0,.55);
+  }
+  dialog::backdrop { background: rgba(5,7,10,.65); }
+  dialog form { background: none; border: none; padding: 0; margin: 0; }
+  dialog h2 { margin: 0; font-size: 17px; }
+
   .toolbar {
     display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
     padding: 10px 16px; margin-bottom: 12px;
@@ -137,30 +148,34 @@
   <div class="stats" id="stats"></div>
 </header>
 <main>
-  <form id="form" autocomplete="off">
-    <input id="title" placeholder="Task title" required maxlength="200">
-    <textarea id="description" placeholder="Description (optional)" rows="2"></textarea>
-    <div class="row">
-      <select id="status">
-        <option value="todo">todo</option>
-        <option value="in_progress">in_progress</option>
-        <option value="done">done</option>
-      </select>
-      <select id="priority">
-        <option value="low">low</option>
-        <option value="medium" selected>medium</option>
-        <option value="high">high</option>
-      </select>
-      <input id="due" type="date">
-      <input id="workdir" placeholder="Workdir (optional, absolute path e.g. /home/me/project)" maxlength="1024">
-    </div>
-    <div class="form-actions">
-      <button class="primary" id="submit" type="submit">Add task</button>
-      <button class="ghost" id="cancel" type="button" hidden>Cancel</button>
-    </div>
-  </form>
+  <dialog id="task-dialog" aria-labelledby="dialog-title">
+    <form id="form" autocomplete="off">
+      <h2 id="dialog-title">Add task</h2>
+      <input id="title" placeholder="Task title" required maxlength="200">
+      <textarea id="description" placeholder="Description (optional)" rows="2"></textarea>
+      <div class="row">
+        <select id="status">
+          <option value="todo">todo</option>
+          <option value="in_progress">in_progress</option>
+          <option value="done">done</option>
+        </select>
+        <select id="priority">
+          <option value="low">low</option>
+          <option value="medium" selected>medium</option>
+          <option value="high">high</option>
+        </select>
+        <input id="due" type="date">
+        <input id="workdir" placeholder="Workdir (optional, absolute path e.g. /home/me/project)" maxlength="1024">
+      </div>
+      <div class="form-actions">
+        <button class="primary" id="submit" type="submit">Add task</button>
+        <button class="ghost" id="cancel" type="button">Cancel</button>
+      </div>
+    </form>
+  </dialog>
 
   <div class="toolbar">
+    <button class="primary" id="open-add">+ Add task</button>
     <label>Status
       <select id="filter-status">
         <option value="">all</option>
@@ -400,6 +415,37 @@ async function cycleStatus(task) {
   } catch (err) { toast(err.message); }
 }
 
+// ---------- add/edit task dialog ----------
+
+const dialog = $('#task-dialog');
+
+function resetTaskForm() {
+  state.editing = null;
+  $('#form').reset();
+  $('#submit').textContent = 'Add task';
+  $('#dialog-title').textContent = 'Add task';
+}
+
+function openTaskDialog() {
+  $('#dialog-title').textContent = state.editing ? 'Edit task' : 'Add task';
+  dialog.showModal();
+  $('#title').focus();
+}
+
+function closeTaskDialog() {
+  dialog.close();
+  resetTaskForm();
+}
+
+// Esc closes a modal <dialog> natively; either way, drop any half-finished
+// edit so the next open starts clean.
+dialog.addEventListener('close', resetTaskForm);
+
+$('#open-add').addEventListener('click', () => {
+  resetTaskForm();
+  openTaskDialog();
+});
+
 function startEdit(task) {
   state.editing = task.id;
   $('#title').value = task.title;
@@ -409,22 +455,14 @@ function startEdit(task) {
   $('#due').value = task.due_date || '';
   $('#workdir').value = task.workdir || '';
   $('#submit').textContent = 'Save changes';
-  $('#cancel').hidden = false;
-  $('#title').focus();
-}
-
-function stopEditing() {
-  state.editing = null;
-  $('#form').reset();
-  $('#submit').textContent = 'Add task';
-  $('#cancel').hidden = true;
+  openTaskDialog();
 }
 
 async function removeTask(task) {
   if (!confirm(`Delete "${task.title}"?`)) return;
   try {
     await api(`/api/tasks/${task.id}`, { method: 'DELETE' });
-    if (state.editing === task.id) stopEditing();
+    if (state.editing === task.id) closeTaskDialog();
     await load();
   } catch (err) { toast(err.message); }
 }
@@ -562,12 +600,12 @@ $('#form').addEventListener('submit', async (e) => {
     } else {
       await api('/api/tasks', { method: 'POST', body: JSON.stringify(payload) });
     }
-    stopEditing();
+    closeTaskDialog();
     await load();
   } catch (err) { toast(err.message); }
 });
 
-$('#cancel').addEventListener('click', stopEditing);
+$('#cancel').addEventListener('click', closeTaskDialog);
 $('#filter-status').addEventListener('change', (e) => { state.status = e.target.value; load(); });
 $('#filter-priority').addEventListener('change', (e) => { state.priority = e.target.value; load(); });
 
