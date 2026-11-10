@@ -3,6 +3,7 @@ mod mcp;
 mod models;
 mod runner;
 mod web;
+mod workdirs;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,24 @@ fn db_path() -> String {
     }
 }
 
+/// Path of the workdirs config file, overridable like the database path.
+///
+/// Defaults to `~/.config/orga/workdirs.json` — next to the database, one
+/// stable location regardless of the working directory `serve` was started
+/// from. An empty `ORGA_WORKDIRS` counts as unset (an empty filename would
+/// silently point at the current directory).
+fn workdirs_path() -> std::path::PathBuf {
+    match std::env::var("ORGA_WORKDIRS") {
+        Ok(path) if !path.trim().is_empty() => std::path::PathBuf::from(path),
+        _ => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| {
+                panic!("ORGA_WORKDIRS is unset and $HOME is not set: cannot locate the workdirs config")
+            });
+            std::path::Path::new(&home).join(".config").join("orga").join("workdirs.json")
+        }
+    }
+}
+
 /// Optional bearer token: when set, the API only answers requests that
 /// present it. Read once at startup.
 fn api_token() -> Option<String> {
@@ -46,10 +65,11 @@ usage: orga-rs [serve [ADDR]] | mcp
   mcp:    MCP stdio bridge to a running server (ORGA_URL, default http://127.0.0.1:3000)
 
 environment:
-  ORGA_DB     database file for `serve` (default: ~/.config/orga/tasks.db)
-  ORGA_URL    base URL of the server for `mcp` (default: http://127.0.0.1:3000)
-  ORGA_TOKEN  when set, `serve` requires 'Authorization: Bearer <token>' on
-              every API request and `mcp` sends it along";
+  ORGA_DB       database file for `serve` (default: ~/.config/orga/tasks.db)
+  ORGA_URL      base URL of the server for `mcp` (default: http://127.0.0.1:3000)
+  ORGA_TOKEN    when set, `serve` requires 'Authorization: Bearer <token>' on
+                every API request and `mcp` sends it along
+  ORGA_WORKDIRS workdirs config file for `serve` (default: ~/.config/orga/workdirs.json)";
 
 #[tokio::main]
 async fn main() {

@@ -36,7 +36,8 @@ The database file defaults to `~/.config/orga/tasks.db` (the directory is
 created on first start); override with the `ORGA_DB` environment variable.
 The MCP bridge connects to
 `http://127.0.0.1:3000` by default; override with `ORGA_URL` (e.g. when the
-server runs on another machine or port).
+server runs on another machine or port). The workdirs config file defaults
+to `~/.config/orga/workdirs.json`; override with `ORGA_WORKDIRS`.
 
 ### Security
 
@@ -69,16 +70,27 @@ JavaScript framework) that talks to the REST API:
   agent assignment, **▶ Run agent**, edit and delete
 - create / edit / delete tasks, filter by status and priority; the
   description field is generously sized by default
-- optional **workdir** per task — the directory its agent runs execute in
+- optional **workdir** per task — the directory its agent runs execute in,
+  picked from the configured list (see below) or entered as a custom path
 - **Agents section**: configure agents (name, command, optional prompt
   template, optional timeout) in an add/edit dialog, edit and delete them
 - per task: pick an agent from the dropdown and press **▶ Run agent** — the
   agent process is spawned by the server and works in the background; if
   the agent is already busy, the run is queued and starts automatically
 - **Agent runs** section: live status of every run (queued/running/…),
-  captured output, cancel button for queued and running runs, delete button
-  for any run (stops it first if still live); the view polls while runs
-  are live
+  captured output — **collapsed behind a "output (N characters)" summary**
+  for finished runs, click to expand; the expanded/collapsed state survives
+  the background refresh — cancel button for queued and running runs, delete
+  button for any run (stops it first if still live); the view polls while
+  runs are live
+- **conversation view** (👁 Live / 👁 View on a run): the prompt the agent
+  received and its output, streamed live (SSE) or replayed for finished
+  runs. Shown as **raw output** by default — exactly what the agent wrote,
+  monospace — or optionally rendered as **Markdown** via the toggle in the
+  dialog (headings, lists, code blocks, tables, links; the choice is
+  remembered). The renderer is deliberately small and escape-first: agent
+  output can never inject HTML, and link URLs are restricted to
+  `http:`/`https:`/`mailto:`/relative — anything else stays plain text
 
 ## Agents
 
@@ -126,6 +138,30 @@ create/update, or with `PUT /api/tasks/{id}/workdir` (`{"workdir": "/abs/path"}`
   clear message instead of spawning in the wrong place
 - unset → the agent runs in the server's working directory
 
+#### The workdirs config
+
+Instead of typing paths by hand, maintain a list of your project
+directories in the workdirs config file — `~/.config/orga/workdirs.json`
+(override with `ORGA_WORKDIRS`), a JSON array of absolute paths:
+
+```json
+[
+  "/home/me/project-a",
+  "/home/me/orga-rs",
+  "/home/me/website"
+]
+```
+
+The dashboard's workdir field is a dropdown built from this list (plus
+"— none —" and a "custom path…" escape hatch for one-off paths); the
+`list_workdirs` MCP tool exposes the same list to LLM clients so they can
+pick a valid workdir when creating tasks. The file is re-read on every
+request, so editing it applies without a restart. Entries are trimmed and
+de-duplicated; invalid entries (relative paths, non-strings) are skipped
+with a log line. A missing file means an empty list; a malformed file is
+reported as an error (`GET /api/workdirs` → 500 with the reason) instead
+of silently hiding your configuration.
+
 **Security note:** the command runs through `sh -c`, so you can use pipes
 and arguments — but the task content travels only via stdin, never on the
 command line. A task title can never inject shell syntax. The command
@@ -159,6 +195,7 @@ Runs whose server died mid-flight are marked `failed` at the next startup
 | `GET`    | `/api/runs/{id}`              | fetch one run incl. output               |
 | `POST`   | `/api/runs/{id}/cancel`       | cancel a live run (409 if not live)      |
 | `DELETE` | `/api/runs/{id}`              | delete a run (stops it first if live)    |
+| `GET`    | `/api/workdirs`               | configured working directories          |
 | `GET`    | `/api/stats`                  | counters incl. overdue                   |
 
 Task fields: `title` (required, 1–200 characters), `description`, `status`
@@ -184,15 +221,18 @@ execution slot is taken; the run starts automatically when the slot frees.
 ## MCP tools
 
 The `mcp` subcommand speaks JSON-RPC 2.0 over stdio (MCP revision 2025-06-18)
-and exposes eleven tools: `list_tasks`, `get_task`, `create_task`,
-`update_task`, `delete_task`, `task_stats`, `list_agents`, `run_task`,
-`get_run`, `list_runs`, `delete_run`.
+and exposes twelve tools: `list_tasks`, `get_task`, `create_task`,
+`update_task`, `delete_task`, `task_stats`, `list_agents`, `list_workdirs`,
+`run_task`, `get_run`, `list_runs`, `delete_run`.
 Tool-level failures (unknown id, invalid enum, server unreachable) are
 returned as `isError: true` results so the model can read and correct them.
 
 Agents are **user-configured** (dashboard or REST API) — the model can list
 and spawn them, but not create or edit them. `run_task` returns immediately
-with the run record; the model polls `get_run` for the outcome.
+with the run record; the model polls `get_run` for the outcome. The same
+goes for the workdirs list: `list_workdirs` returns the user-maintained
+config so the model can pick a valid workdir, but the list itself is not
+editable through the tools.
 
 **The MCP bridge requires a running server.** Start `orga-rs serve` first,
 then register the bridge in any stdio MCP client (Claude Desktop, etc.):

@@ -26,13 +26,15 @@ use crate::models::{
 };
 use crate::runner::{self, AgentSlots, RunEvent, RunRegistry, SharedRegistry};
 
-/// Router state: the database, the live-run registry and the per-agent
-/// execution slots (one live run per agent).
+/// Router state: the database, the live-run registry, the per-agent
+/// execution slots (one live run per agent) and the path of the workdirs
+/// config file (re-read per request, so edits apply without a restart).
 #[derive(Clone)]
 pub struct AppState {
     pub db: SharedDb,
     pub registry: SharedRegistry,
     pub slots: std::sync::Arc<AgentSlots>,
+    pub workdirs: std::path::PathBuf,
 }
 
 pub async fn serve(
@@ -50,6 +52,7 @@ pub async fn serve(
         db,
         registry: Arc::new(RunRegistry::default()),
         slots: Arc::new(AgentSlots::default()),
+        workdirs: crate::workdirs_path(),
     };
     axum::serve(listener, router(state, token))
         .with_graceful_shutdown(shutdown_signal())
@@ -114,6 +117,7 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         )
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/stream", get(stream_run))
+        .route("/api/workdirs", get(list_workdirs))
         .route("/api/stats", get(get_stats))
         .route_layer(middleware::from_fn_with_state(token, require_token))
         .with_state(state);
@@ -400,6 +404,28 @@ async fn run_task(
     Ok((StatusCode::CREATED, Json(run)))
 }
 
+// ---------- workdirs config ----------
+
+/// The configured working directories (see [`crate::workdirs`]): the list
+/// the dashboard's workdir dropdown and the `list_workdirs` MCP tool offer.
+/// The config file is re-read on every call, so editing it applies without
+/// a restart. A malformed config is a 500 — but unlike other internal
+/// errors it carries the real reason (file + JSON error) in the body: it is
+/// user-fixable configuration feedback, not sensitive internals, and
+/// silently serving an empty list would hide the user's configuration.
+async fn list_workdirs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<String>>, axum::response::Response> {
+    match crate::workdirs::load(&state.workdirs) {
+        Ok(dirs) => Ok(Json(dirs)),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response()),
+    }
+}
+
 // ---------- runs ----------
 
 #[derive(Deserialize)]
@@ -657,13 +683,29 @@ mod tests {
     }
 
     fn app_with_token(token: Option<String>) -> Router {
+        app_with(token, workdirs_test_path())
+    }
+
+    fn app_with(token: Option<String>, workdirs: std::path::PathBuf) -> Router {
         let db: SharedDb = Arc::new(Mutex::new(Db::open(":memory:").unwrap()));
         let state = AppState {
             db,
             registry: Arc::new(RunRegistry::default()),
             slots: Arc::new(AgentSlots::default()),
+            workdirs,
         };
         router(state, token)
+    }
+
+    /// A unique workdirs config path per `app()` call, so tests never share
+    /// state. The file is not created — a missing config is an empty list.
+    fn workdirs_test_path() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "orga-rs-workdirs-webtest-{}-{}.json",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
     }
 
     async fn call(app: &Router, method: &str, uri: &str, body: Option<&str>) -> Response {
@@ -706,6 +748,117 @@ mod tests {
         let html = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(html.contains("orga"));
         assert!(html.contains("/api/tasks"));
+        // The conversation view ships with its raw/markdown toggle and the
+        // renderer (smoke test: the embedded page contains the feature).
+        assert!(html.contains("id=\"stream-md\""));
+        assert!(html.contains("renderMarkdown"));
+        assert!(html.contains("Render as Markdown"));
+        // A finished run's captured output is collapsible (native
+        // <details>, collapsed by default, state kept across re-renders).
+        assert!(html.contains("details class=\"run-output\""));
+        assert!(html.contains("expandedRuns"));
+    }
+
+    /// The dashboard's script block must stay syntactically balanced. A
+    /// full JS parser is out of scope for a Rust test suite; this walks
+    /// the script with a small lexer that skips the constructs where
+    /// brackets do not count — comments, strings, regex literals and
+    /// template literals (including `${…}` interpolations, which nest in
+    /// this script) — and checks that the remaining brackets balance.
+    /// This catches the classic embedding mistakes: a stray brace in a
+    /// template literal, a truncated regex, a quote eaten by a comment.
+    #[test]
+    fn dashboard_script_brackets_are_balanced() {
+        let html = include_str!("dashboard.html");
+        let script = html
+            .split("<script>")
+            .nth(1)
+            .and_then(|rest| rest.split("</script>").next())
+            .expect("script block");
+
+        let mut depth = 0i32;
+        // Brace depth at which each open `${` interpolation closes; the
+        // script nests templates inside interpolations (renderRuns etc.).
+        let mut templates: Vec<i32> = Vec::new();
+        let mut in_template = false;
+        let mut chars = script.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if in_template {
+                match c {
+                    '\\' => { chars.next(); }
+                    '`' => in_template = false,
+                    '$' if chars.peek() == Some(&'{') => {
+                        chars.next();
+                        templates.push(depth);
+                        depth += 1;      // the interpolation's opening brace
+                        in_template = false; // its body is code again
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '/' => match chars.peek() {
+                    // line comment
+                    Some('/') => {
+                        for c2 in chars.by_ref() {
+                            if c2 == '\n' { break; }
+                        }
+                    }
+                    // block comment
+                    Some('*') => {
+                        chars.next();
+                        let mut prev = '\0';
+                        for c2 in chars.by_ref() {
+                            if prev == '*' && c2 == '/' { break; }
+                            prev = c2;
+                        }
+                    }
+                    // regex literal (the script contains no division, so
+                    // every other `/` starts one); `[…]` classes may hold
+                    // a `/` without closing it
+                    _ => {
+                        let mut in_class = false;
+                        while let Some(c2) = chars.next() {
+                            match c2 {
+                                '\\' => { chars.next(); }
+                                '[' => in_class = true,
+                                ']' => in_class = false,
+                                '/' if !in_class => break,
+                                _ => {}
+                            }
+                        }
+                        // trailing flags (g, i, …)
+                        while matches!(chars.peek(), Some(n) if n.is_ascii_alphabetic()) {
+                            chars.next();
+                        }
+                    }
+                },
+                // string literal
+                '\'' | '"' => {
+                    let quote = c;
+                    while let Some(c2) = chars.next() {
+                        if c2 == '\\' { chars.next(); }
+                        else if c2 == quote { break; }
+                    }
+                }
+                '`' => in_template = true,
+                '{' | '(' | '[' => depth += 1,
+                '}' | ')' | ']' => {
+                    depth -= 1;
+                    // A `}` that brings the depth back to the top `${`'s
+                    // entry value closes the interpolation, not code.
+                    if c == '}' && templates.last() == Some(&depth) {
+                        templates.pop();
+                        in_template = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "unbalanced brackets in the dashboard script");
+        assert!(templates.is_empty(), "unclosed template interpolation");
     }
 
     #[tokio::test]
@@ -1208,6 +1361,35 @@ mod tests {
         // unknown task -> 404
         let res = call(&app, "PUT", "/api/tasks/999/workdir", Some(r#"{"workdir":"/tmp"}"#)).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn workdirs_endpoint_serves_the_config_file() {
+        // The app is built with a known config path so the test can write
+        // to the exact file the endpoint reads.
+        let path = workdirs_test_path();
+        let app = app_with(None, path.clone());
+
+        // No config file -> an empty list (the feature is optional).
+        let res = call(&app, "GET", "/api/workdirs", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, serde_json::json!([]));
+
+        // A config file is picked up without a restart (re-read per call).
+        std::fs::write(&path, r#"["/tmp/alpha", "relative", "/tmp/alpha"]"#).unwrap();
+        let res = call(&app, "GET", "/api/workdirs", None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, serde_json::json!(["/tmp/alpha"]));
+        let _ = std::fs::remove_file(&path);
+
+        // A malformed config is a 500 with the reason in the body (the
+        // message names the file and the JSON error, so it is fixable).
+        std::fs::write(&path, "{not json").unwrap();
+        let res = call(&app, "GET", "/api/workdirs", None).await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(res).await;
+        assert!(body["error"].as_str().unwrap().contains("not valid JSON"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

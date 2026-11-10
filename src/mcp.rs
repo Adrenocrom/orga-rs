@@ -108,7 +108,8 @@ On update_task, omit fields you do not want to change and pass due_date as an em
 string to clear it. Use task_stats for a quick summary. Configured agents (list_agents) \
 can be spawned on a task with run_task; they work in the background — poll get_run \
 for the outcome. Each agent runs one task at a time; further runs are queued and start \
-automatically. A task's optional workdir is the directory the agent executes in."
+automatically. A task's optional workdir is the directory the agent executes in; \
+list_workdirs returns the user-configured directories to pick from."
     })
 }
 
@@ -140,6 +141,7 @@ fn call_tool(api: &Api, params: &Value) -> Result<Value, Value> {
         "delete_task" => tool_delete_task(api, &args),
         "task_stats" => tool_task_stats(api),
         "list_agents" => tool_list_agents(api),
+        "list_workdirs" => tool_list_workdirs(api),
         "run_task" => tool_run_task(api, &args),
         "get_run" => tool_get_run(api, &args),
         "list_runs" => tool_list_runs(api, &args),
@@ -271,6 +273,33 @@ the REST API (POST /api/agents)."
             field("name"),
             field("command")
         ));
+    }
+    Ok(ToolOutput::text(lines.join("\n")))
+}
+
+/// List the configured working directories (the user-maintained config file
+/// the dashboard's workdir dropdown is built from). Read-only: the model
+/// can pick from it for a task's workdir but not edit it.
+fn tool_list_workdirs(api: &Api) -> ToolResult {
+    let dirs = api.get_json("/api/workdirs", "list workdirs")?;
+    let Some(arr) = dirs.as_array() else {
+        return Err("server returned an unexpected response".to_string());
+    };
+    if arr.is_empty() {
+        return Ok(ToolOutput::text(
+            "No working directories configured. The list lives in the workdirs \
+config file (~/.config/orga/workdirs.json, a JSON array of absolute paths) \
+maintained by the user; a task's workdir can also be set directly."
+                .to_string(),
+        ));
+    }
+    let mut lines = vec![format!(
+        "{} configured working director{}:",
+        arr.len(),
+        if arr.len() == 1 { "y" } else { "ies" }
+    )];
+    for dir in arr {
+        lines.push(dir.as_str().unwrap_or_default().to_string());
     }
     Ok(ToolOutput::text(lines.join("\n")))
 }
@@ -635,6 +664,15 @@ through this tool.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "list_workdirs",
+            "description": "List the configured working directories the user \
+maintains in the workdirs config file (~/.config/orga/workdirs.json). Use one \
+of these paths when setting a task's workdir (create_task/update_task) so the \
+agent executes in the right project directory. The list is user-maintained and \
+read-only for the model.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "run_task",
             "description": "Spawn a configured agent to work on a task. The agent \
 process is started by the server and runs in the background; this returns \
@@ -803,6 +841,8 @@ mod tests {
             db,
             registry: std::sync::Arc::new(crate::runner::RunRegistry::default()),
             slots: std::sync::Arc::new(crate::runner::AgentSlots::default()),
+            // No config file exists at this path -> an empty workdirs list.
+            workdirs: std::env::temp_dir().join("orga-rs-workdirs-mcptest.json"),
         };
         let app = crate::web::router(state, None);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -854,7 +894,7 @@ mod tests {
         assert!(responses[0]["result"]["instructions"].as_str().unwrap().contains("YYYY-MM-DD"));
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         let stats_tool = tools.iter().find(|t| t["name"] == "task_stats").unwrap();
         assert!(stats_tool["outputSchema"].is_object());
 
@@ -988,6 +1028,21 @@ mod tests {
         let runs = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(runs.contains("echoer"));
         assert!(runs.contains("completed") || runs.contains("running"));
+    }
+
+    #[test]
+    fn stdio_workdirs_tool_lists_the_configured_directories() {
+        let (api, _port) = spawn_server();
+        // The spawn_server helper points at a config path that does not
+        // exist, so the tool reports the empty list with a hint.
+        let responses = session(
+            &api,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workdirs","arguments":{}}}"#,
+        );
+        assert_eq!(responses[0]["result"]["isError"], false);
+        let text = responses[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("No working directories configured"), "{text}");
+        assert!(text.contains("workdirs.json"), "{text}");
     }
 
     #[test]

@@ -186,20 +186,75 @@
   }
   .run .times { color: var(--muted); font-size: 12px; }
 
+  /* a finished run's captured output, collapsed behind its summary */
+  .run details.run-output { margin: 8px 0 0; }
+  .run details.run-output > summary { padding: 2px 0; }
+
   /* live conversation dialog */
   #stream-dialog { width: min(860px, calc(100vw - 48px)); }
   #stream-dialog h2 { margin: 0 0 4px; font-size: 17px; }
   #stream-dialog .sub { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  #stream-dialog .stream-bar { display: flex; gap: 10px; align-items: flex-start; }
+  #stream-dialog .stream-bar > div { flex: 1; min-width: 0; }
+  #stream-dialog .stream-bar button { flex-shrink: 0; font-size: 12px; padding: 4px 10px; }
+  button.ghost.active { border-color: var(--accent); color: var(--accent); }
   #stream-log {
     background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-    padding: 12px; margin: 0 0 12px; font: 12px/1.55 ui-monospace, "Cascadia Code", monospace;
-    white-space: pre-wrap; overflow-wrap: anywhere;
+    padding: 12px; margin: 0 0 12px;
     height: min(60vh, 520px); overflow-y: auto;
+  }
+  /* raw mode (default): exactly what the agent wrote, monospace */
+  #stream-log pre.raw {
+    margin: 0; font: 12px/1.55 ui-monospace, "Cascadia Code", monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  /* prompt/status/end segments stay plain text in both modes */
+  #stream-log > span {
+    font: 12px/1.55 ui-monospace, "Cascadia Code", monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere;
   }
   #stream-log .prompt { color: var(--accent); }
   #stream-log .note { color: var(--muted); }
   #stream-log .resync { color: var(--danger); }
   #stream-log .end { color: var(--done); }
+  /* markdown mode (optional): the agent's output rendered as a document */
+  #stream-log .md { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+  #stream-log .md > *:first-child { margin-top: 0; }
+  #stream-log .md > *:last-child { margin-bottom: 0; }
+  #stream-log .md h1, #stream-log .md h2, #stream-log .md h3,
+  #stream-log .md h4, #stream-log .md h5, #stream-log .md h6 {
+    margin: 14px 0 6px; line-height: 1.3;
+  }
+  #stream-log .md h1 { font-size: 18px; }
+  #stream-log .md h2 { font-size: 16px; }
+  #stream-log .md h3 { font-size: 15px; }
+  #stream-log .md h4, #stream-log .md h5, #stream-log .md h6 { font-size: 14px; }
+  #stream-log .md p { margin: 8px 0; }
+  #stream-log .md pre.md-code {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; margin: 8px 0; overflow-x: auto; white-space: pre;
+    font: 12px/1.5 ui-monospace, "Cascadia Code", monospace;
+  }
+  #stream-log .md code {
+    background: var(--panel); border-radius: 4px; padding: 1px 5px;
+    font: 12px/1.4 ui-monospace, "Cascadia Code", monospace;
+  }
+  #stream-log .md pre.md-code code { background: none; border-radius: 0; padding: 0; }
+  #stream-log .md table { border-collapse: collapse; margin: 8px 0; font-size: 12px; }
+  #stream-log .md th, #stream-log .md td {
+    border: 1px solid var(--border); padding: 4px 10px; text-align: left;
+  }
+  #stream-log .md th { background: var(--panel); }
+  #stream-log .md blockquote {
+    margin: 8px 0; padding: 2px 12px; border-left: 3px solid var(--accent);
+    color: var(--muted);
+  }
+  #stream-log .md ul, #stream-log .md ol { display: block; margin: 8px 0; padding-left: 24px; }
+  #stream-log .md ul { list-style: disc; }
+  #stream-log .md ol { list-style: decimal; }
+  #stream-log .md li { margin: 2px 0; }
+  #stream-log .md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+  #stream-log .md a { color: var(--accent); }
   #stream-dialog .form-actions { justify-content: flex-end; }
 
   #empty { color: var(--muted); text-align: center; padding: 30px; }
@@ -259,7 +314,8 @@
           <option value="high">high</option>
         </select>
         <input id="due" type="date">
-        <input id="workdir" placeholder="Workdir (optional, absolute path e.g. /home/me/project)" maxlength="1024">
+        <select id="workdir" title="Working directory for agent runs"></select>
+        <input id="workdir-custom" placeholder="Custom workdir (absolute path e.g. /home/me/project)" maxlength="1024" hidden>
       </div>
       <div class="form-actions">
         <button class="primary" id="submit" type="submit">Add task</button>
@@ -303,9 +359,14 @@
 </main>
 
 <dialog id="stream-dialog" aria-labelledby="stream-title">
-  <h2 id="stream-title">Live conversation</h2>
-  <p class="sub" id="stream-sub"></p>
-  <pre id="stream-log" aria-live="polite"></pre>
+  <div class="stream-bar">
+    <div>
+      <h2 id="stream-title">Live conversation</h2>
+      <p class="sub" id="stream-sub"></p>
+    </div>
+    <button class="ghost" id="stream-md" type="button" aria-pressed="false"></button>
+  </div>
+  <div id="stream-log" aria-live="polite"></div>
   <div class="form-actions">
     <button class="ghost" id="stream-close" type="button">Close</button>
   </div>
@@ -321,9 +382,11 @@ const state = {
   selected: null,          // id of the task shown in the detail pane
   tasks: [],                // tasks matching the current filters
   agents: [],               // configured agents (id, name, command, ...)
+  workdirs: [],             // configured working directories (workdirs.json)
   agentEditing: null,       // agent id being edited in the agent dialog
   runs: [],                 // recent runs
   pollTimer: null,          // runs polling while any run is live
+  expandedRuns: new Set(),  // run ids whose output block is expanded
 };
 
 // Escape user content before it goes into innerHTML.
@@ -364,15 +427,17 @@ async function load() {
     const params = new URLSearchParams();
     if (state.status) params.set('status', state.status);
     if (state.priority) params.set('priority', state.priority);
-    const [tasks, stats, agents, runs] = await Promise.all([
+    const [tasks, stats, agents, runs, workdirs] = await Promise.all([
       api('/api/tasks?' + params.toString()),
       api('/api/stats'),
       api('/api/agents'),
       api('/api/runs?limit=50'),
+      api('/api/workdirs'),
     ]);
     renderStats(stats);
     state.tasks = tasks;
     state.agents = agents;
+    state.workdirs = workdirs;
     state.runs = runs;
     renderList();
     renderDetail();
@@ -555,6 +620,50 @@ async function cycleStatus(task) {
   } catch (err) { toast(err.message); }
 }
 
+// ---------- workdir select (task dialog) ----------
+
+// The workdir field is a dropdown built from the configured directories
+// (workdirs.json) plus an escape hatch for a one-off path. The select's
+// value is the path itself; the sentinel '__custom__' reveals the text
+// input. A task whose workdir is not in the config still shows it — as a
+// selected "current" option, so saving does not silently change it.
+function renderWorkdirSelect(current) {
+  const select = $('#workdir');
+  const options = ['<option value="">— none —</option>'];
+  for (const dir of state.workdirs) {
+    options.push(`<option value="${esc(dir)}">${esc(dir)}</option>`);
+  }
+  if (current && !state.workdirs.includes(current)) {
+    options.push(`<option value="${esc(current)}">${esc(current)} (current)</option>`);
+  }
+  options.push('<option value="__custom__">custom path…</option>');
+  select.innerHTML = options.join('');
+
+  // Preselect the current workdir when it is known, otherwise "— none —".
+  select.value = current || '';
+  const showCustom = select.value === '__custom__';
+  $('#workdir-custom').hidden = !showCustom;
+  if (showCustom) $('#workdir-custom').value = current || '';
+}
+
+// The effective workdir of the form: the selected path, the custom input's
+// value, or '' (which clears the field on save).
+function formWorkdir() {
+  const select = $('#workdir');
+  if (select.value === '__custom__') return $('#workdir-custom').value.trim();
+  return select.value;
+}
+
+$('#workdir').addEventListener('change', () => {
+  const custom = $('#workdir-custom');
+  const isCustom = $('#workdir').value === '__custom__';
+  custom.hidden = !isCustom;
+  if (isCustom) {
+    custom.value = '';
+    custom.focus();
+  }
+});
+
 // ---------- add/edit task dialog ----------
 
 const dialog = $('#task-dialog');
@@ -562,6 +671,7 @@ const dialog = $('#task-dialog');
 function resetTaskForm() {
   state.editing = null;
   $('#form').reset();
+  renderWorkdirSelect(''); // fresh add: configured dirs, "— none —" selected
   $('#submit').textContent = 'Add task';
   $('#dialog-title').textContent = 'Add task';
 }
@@ -593,7 +703,7 @@ function startEdit(task) {
   $('#status').value = task.status;
   $('#priority').value = task.priority;
   $('#due').value = task.due_date || '';
-  $('#workdir').value = task.workdir || '';
+  renderWorkdirSelect(task.workdir || '');
   $('#submit').textContent = 'Save changes';
   openTaskDialog();
 }
@@ -730,16 +840,27 @@ function renderRuns() {
         <span class="times">on task #${run.task_id} · started ${esc(started)}${ended ? ` · ended ${esc(ended)}` : ''}</span>
         <span class="spacer"></span>
         ${run.exit_code !== null && run.exit_code !== undefined ? `<span class="badge">exit ${run.exit_code}</span>` : ''}
-        ${run.status === 'running' || run.status === 'queued' ? `<button class="ghost" data-action="stream-run">👁 Live</button>` : ''}
+        <button class="ghost" data-action="stream-run" title="Open the conversation view (raw output or rendered markdown)">${run.status === 'running' || run.status === 'queued' ? '👁 Live' : '👁 View'}</button>
         ${run.status === 'running' || run.status === 'queued' ? `<button class="danger" data-action="cancel-run">Cancel</button>` : ''}
         <button class="danger" data-action="delete-run">Delete</button>
       </div>
-      ${run.output ? `<pre>${esc(run.output)}</pre>` : ''}`;
+      ${run.output ? `
+      <details class="run-output"${state.expandedRuns.has(run.id) ? ' open' : ''}>
+        <summary>output (${run.output.length.toLocaleString()} characters)</summary>
+        <pre>${esc(run.output)}</pre>
+      </details>` : ''}`;
     const cancelBtn = li.querySelector('[data-action="cancel-run"]');
     if (cancelBtn) cancelBtn.addEventListener('click', () => cancelRun(run));
-    const streamBtn = li.querySelector('[data-action="stream-run"]');
-    if (streamBtn) streamBtn.addEventListener('click', () => openStream(run));
+    li.querySelector('[data-action="stream-run"]').addEventListener('click', () => openStream(run));
     li.querySelector('[data-action="delete-run"]').addEventListener('click', () => deleteRun(run));
+    // Remember the open/closed state across re-renders: renderRuns() runs
+    // again every few seconds while any run is live, and a native <details>
+    // would otherwise snap shut under the user's cursor.
+    const outputDetails = li.querySelector('details.run-output');
+    if (outputDetails) outputDetails.addEventListener('toggle', () => {
+      if (outputDetails.open) state.expandedRuns.add(run.id);
+      else state.expandedRuns.delete(run.id);
+    });
     list.appendChild(li);
   }
 }
@@ -755,8 +876,201 @@ async function deleteRun(run) {
   if (!confirm(`Delete run #${run.id} (${run.agent_name})? This stops it if it is still running and removes it from history.`)) return;
   try {
     await api(`/api/runs/${run.id}`, { method: 'DELETE' });
+    state.expandedRuns.delete(run.id);
     await refreshRuns();
   } catch (err) { toast(err.message); }
+}
+
+// ---------- markdown renderer (for the run conversation view) ----------
+//
+// Renders the subset of markdown that coding agents actually produce:
+// headings, bullet/numbered lists (incl. [ ]/[x] task items), fenced code
+// blocks, GFM tables, blockquotes, horizontal rules, bold/italic/strike,
+// inline code and links. Two rules keep untrusted agent output safe:
+//
+// 1. escape-first — every piece of text runs through esc() before any
+//    markup is introduced, and the only tags ever generated are the fixed
+//    ones below, so agent output can never inject HTML or event handlers;
+// 2. link URLs are restricted to http:, https:, mailto: and relative paths
+//    (javascript:, data:, … and protocol-relative // URLs are rejected and
+//    shown as plain text). Images become links to their URL instead of
+//    <img> tags — agent output must not make the dashboard fetch things.
+
+// Inline markup. Code spans are extracted first (their content is never
+// further parsed) and parked behind \u0000 placeholders; the rest is
+// escaped, wrapped in tags, then the code spans are restored.
+function mdInline(text) {
+  const codes = [];
+  let s = text.replace(/(`+)([\s\S]*?)\1/g, (_m, _ticks, content) => {
+    let c = content;
+    // CommonMark: strip one leading+trailing space unless it is all spaces
+    if (c.length > 2 && c.startsWith(' ') && c.endsWith(' ') && c.trim() !== '') c = c.slice(1, -1);
+    codes.push(`<code>${esc(c)}</code>`);
+    return `\u0000${codes.length - 1}\u0000`;
+  });
+  s = esc(s);
+  // images and links: [label](url). The url part allows one level of
+  // balanced parentheses (Wikipedia-style URLs); an optional "title" is
+  // ignored (after esc() a literal quote only exists as &quot;).
+  const urlPart = '((?:[^()\\s]+|\\([^()]*\\))+)';
+  const titlePart = '(?:\\s+&quot;.*?&quot;)?';
+  s = s.replace(new RegExp('!\\[([^\\]]*)\\]\\(' + urlPart + titlePart + '\\)', 'g'),
+    (m, alt, url) => {
+      const safe = mdSafeUrl(url);
+      return safe === null ? m : `<a href="${safe}" target="_blank" rel="noopener noreferrer">🖼 ${alt || url}</a>`;
+    });
+  s = s.replace(new RegExp('\\[([^\\]]*)\\]\\(' + urlPart + titlePart + '\\)', 'g'),
+    (m, label, url) => {
+      const safe = mdSafeUrl(url);
+      return safe === null ? m : `<a href="${safe}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    });
+  s = s.replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|\W)__([^_]+)__(?=\W|$)/g, '$1<strong>$2</strong>');
+  s = s.replace(/\*([^*\s][^*]*?)\*/g, '<em>$1</em>');
+  s = s.replace(/(^|\W)_([^_]+)_(?=\W|$)/g, '$1<em>$2</em>');
+  s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => codes[Number(i)] || '');
+}
+
+// `url` arrives HTML-escaped (it is a slice of escaped text); the scheme
+// checks are prefix tests and the escaped form is what goes into href=.
+// A NUL byte means the "URL" contains a code-span placeholder — not a URL.
+function mdSafeUrl(url) {
+  const u = url.trim();
+  if (u.includes('\u0000')) return null;
+  if (u.startsWith('//')) return null;               // protocol-relative
+  if (/^(https?:|mailto:)/i.test(u)) return u;       // always fine
+  if (/^[a-z][a-z0-9+.-]*:/i.test(u)) return null;  // any other scheme
+  return u;                                          // relative URL
+}
+
+// A GFM table delimiter row: | --- | :-: | …
+function mdIsTableDelim(line) {
+  return line.includes('|') && line.includes('-')
+    && /^\s{0,3}\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(line);
+}
+
+// Block-level pass: one line group at a time. Soft line breaks inside a
+// paragraph become <br> — the convention chat-style markdown uses.
+// NUL bytes are stripped first: mdInline parks code spans behind \u0000
+// placeholders, so a literal NUL in the output must not be able to
+// forge one (NULs are invisible in the raw view anyway).
+function renderMarkdown(src) {
+  const lines = String(src ?? '')
+    .replace(/\u0000/g, '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n');
+  const out = [];
+  let para = [];
+  const flushPara = () => {
+    if (para.length) {
+      out.push(`<p>${para.map(mdInline).join('<br>')}</p>`);
+      para = [];
+    }
+  };
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (line.trim() === '') { flushPara(); i++; continue; }
+
+    // fenced code block: ``` or ~~~, closed by a fence of the same char
+    const fence = line.match(/^(\s{0,3})(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      flushPara();
+      const close = new RegExp('^\\s{0,3}' + fence[2][0] + '{' + fence[2].length + ',}\\s*$');
+      const code = [];
+      i++;
+      while (i < lines.length && !close.test(lines[i])) { code.push(lines[i]); i++; }
+      i++; // the closing fence; an unclosed block simply ends at the input
+      out.push(`<pre class="md-code"><code>${esc(code.join('\n'))}</code></pre>`);
+      continue;
+    }
+
+    // heading: one to six # followed by text
+    const heading = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
+    if (heading) {
+      flushPara();
+      out.push(`<h${heading[1].length}>${mdInline(heading[2].trim())}</h${heading[1].length}>`);
+      i++;
+      continue;
+    }
+
+    // setext heading: a paragraph directly followed by a line of only =
+    // or - (no internal spaces — "- - -" stays a thematic break)
+    if (para.length && /^\s{0,3}(=+|-+)\s*$/.test(line)) {
+      const level = line.trim().startsWith('=') ? 1 : 2;
+      out.push(`<h${level}>${para.map(mdInline).join('<br>')}</h${level}>`);
+      para = [];
+      i++;
+      continue;
+    }
+
+    // horizontal rule: three or more of the same marker
+    if (/^\s{0,3}([-*_])\s*(?:\1\s*){2,}$/.test(line)) { flushPara(); out.push('<hr>'); i++; continue; }
+
+    // blockquote: consecutive '>' lines, re-parsed (all markers stripped)
+    if (/^\s{0,3}>/.test(line)) {
+      flushPara();
+      const quote = [];
+      while (i < lines.length && /^\s{0,3}>/.test(lines[i])) {
+        quote.push(lines[i].replace(/^\s{0,3}(?:>\s?)+/, ''));
+        i++;
+      }
+      out.push(`<blockquote>${renderMarkdown(quote.join('\n'))}</blockquote>`);
+      continue;
+    }
+
+    // GFM table: a pipe row followed by a delimiter row
+    if (line.includes('|') && i + 1 < lines.length && mdIsTableDelim(lines[i + 1])) {
+      flushPara();
+      const cells = (l) => {
+        let s = l.trim();
+        if (s.startsWith('|')) s = s.slice(1);
+        if (s.endsWith('|')) s = s.slice(0, -1);
+        return s.split('|').map((c) => c.trim());
+      };
+      const head = cells(line);
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim() !== '' && lines[i].includes('|')) {
+        rows.push(cells(lines[i]));
+        i++;
+      }
+      out.push(
+        `<table><thead><tr>${head.map((c) => `<th>${mdInline(c)}</th>`).join('')}</tr></thead>` +
+        `<tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${mdInline(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+      );
+      continue;
+    }
+
+    // list: consecutive bullet (- * +) or numbered (1. 1)) items
+    const bullet = /^\s{0,3}[-*+]\s+(.*)$/.test(line);
+    const ordered = /^\s{0,3}\d{1,9}[.)]\s+(.*)$/.test(line);
+    if (bullet || ordered) {
+      flushPara();
+      const itemRe = ordered ? /^\s{0,3}\d{1,9}[.)]\s+(.*)$/ : /^\s{0,3}[-*+]\s+(.*)$/;
+      const items = [];
+      while (i < lines.length && itemRe.test(lines[i])) {
+        items.push(lines[i].replace(itemRe, '$1'));
+        i++;
+      }
+      const lis = items.map((item) => {
+        const task = item.match(/^\[([ xX])\]\s*(.*)$/); // GFM task item
+        if (task) return `<li>${task[1] === ' ' ? '☐' : '☑'} ${mdInline(task[2])}</li>`;
+        return `<li>${mdInline(item)}</li>`;
+      });
+      const tag = ordered ? 'ol' : 'ul';
+      out.push(`<${tag}>${lis.join('')}</${tag}>`);
+      continue;
+    }
+
+    para.push(line); // plain paragraph text
+    i++;
+  }
+  flushPara();
+  return out.join('\n');
 }
 
 // ---------- live conversation streaming ----------
@@ -764,8 +1078,78 @@ async function deleteRun(run) {
 // One open stream at a time: opening another closes the previous.
 let streamAbort = null;
 
-// Watch a run's conversation live: the prompt the agent received, then its
-// stdout/stderr as it is produced, until the run ends. Uses fetch + a
+// The agent's output accumulated across chunks — the markdown view always
+// re-renders the whole text (a block can span chunks), the raw view appends.
+let streamOutput = '';
+// The element the output is rendered into: <pre class="raw"> or
+// <div class="md">, created when the first chunk arrives.
+let streamOutputEl = null;
+// 'raw' (default) or 'md'; the choice is remembered in localStorage.
+let streamMode = 'raw';
+// Set while a markdown re-render is scheduled for the current frame.
+let mdRenderPending = false;
+
+function updateStreamToggle() {
+  const btn = $('#stream-md');
+  btn.textContent = streamMode === 'md' ? 'Show raw output' : 'Render as Markdown';
+  btn.setAttribute('aria-pressed', String(streamMode === 'md'));
+  btn.classList.toggle('active', streamMode === 'md');
+}
+
+// Re-render the accumulated output in the (possibly new) mode, keeping the
+// node's position in the log so prompt/status segments stay in order.
+function rebuildStreamOutput() {
+  if (!streamOutputEl) return;
+  const log = $('#stream-log');
+  const el = document.createElement(streamMode === 'md' ? 'div' : 'pre');
+  el.className = streamMode === 'md' ? 'md' : 'raw';
+  if (streamMode === 'md') el.innerHTML = renderMarkdown(streamOutput);
+  else el.textContent = streamOutput;
+  log.replaceChild(el, streamOutputEl);
+  streamOutputEl = el;
+  log.scrollTop = log.scrollHeight;
+}
+
+// A chunk of agent output: append in raw mode; in markdown mode re-render
+// the whole accumulated text, at most once per animation frame.
+function appendOutput(text) {
+  streamOutput += text;
+  const log = $('#stream-log');
+  if (!streamOutputEl) {
+    streamOutputEl = document.createElement(streamMode === 'md' ? 'div' : 'pre');
+    streamOutputEl.className = streamMode === 'md' ? 'md' : 'raw';
+    log.appendChild(streamOutputEl);
+  }
+  if (streamMode === 'md') {
+    if (!mdRenderPending) {
+      mdRenderPending = true;
+      requestAnimationFrame(() => {
+        mdRenderPending = false;
+        if (streamOutputEl && streamMode === 'md') {
+          streamOutputEl.innerHTML = renderMarkdown(streamOutput);
+          log.scrollTop = log.scrollHeight;
+        }
+      });
+    }
+  } else {
+    streamOutputEl.appendChild(document.createTextNode(text));
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+// Prompt, status and error segments are always plain text.
+function appendSegment(text, cls) {
+  const log = $('#stream-log');
+  const span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = text;
+  log.appendChild(span);
+  log.scrollTop = log.scrollHeight;
+}
+
+// Watch a run's conversation: the prompt the agent received, then its
+// stdout/stderr as it is produced (live runs), or the stored output
+// (finished runs — the stream endpoint replays it). Uses fetch + a
 // ReadableStream reader instead of EventSource because EventSource cannot
 // send the Authorization header the server may require.
 async function openStream(run) {
@@ -774,18 +1158,16 @@ async function openStream(run) {
 
   const dialog = $('#stream-dialog');
   const log = $('#stream-log');
+  const live = run.status === 'running' || run.status === 'queued';
   $('#stream-title').textContent = `Run #${run.id} — ${run.agent_name}`;
-  $('#stream-sub').textContent = `task #${run.task_id} · live conversation (prompt + output)`;
-  log.textContent = '';
+  $('#stream-sub').textContent = `task #${run.task_id} · ${live ? 'live conversation (prompt + output)' : 'recorded output'}`;
+  log.innerHTML = '';
+  streamOutput = '';
+  streamOutputEl = null;
+  mdRenderPending = false;
+  streamMode = localStorage.getItem('orga-stream-mode') === 'md' ? 'md' : 'raw';
+  updateStreamToggle();
   dialog.showModal();
-
-  const append = (text, cls) => {
-    const span = document.createElement('span');
-    if (cls) span.className = cls;
-    span.textContent = text;
-    log.appendChild(span);
-    log.scrollTop = log.scrollHeight;
-  };
 
   try {
     const token = localStorage.getItem('orga-token');
@@ -812,16 +1194,16 @@ async function openStream(run) {
       while ((sep = buffer.indexOf('\n\n')) !== -1) {
         const frame = buffer.slice(0, sep);
         buffer = buffer.slice(sep + 2);
-        handleStreamFrame(frame, append);
+        handleStreamFrame(frame);
       }
     }
   } catch (err) {
-    if (err.name !== 'AbortError') append(`\n[stream error: ${err.message}]\n`, 'resync');
+    if (err.name !== 'AbortError') appendSegment(`\n[stream error: ${err.message}]\n`, 'resync');
   }
 }
 
 // One SSE frame: `event: <name>` + `data: <text>` lines.
-function handleStreamFrame(frame, append) {
+function handleStreamFrame(frame) {
   let event = 'message';
   const data = [];
   for (const line of frame.split('\n')) {
@@ -830,13 +1212,22 @@ function handleStreamFrame(frame, append) {
   }
   const text = data.join('\n');
   switch (event) {
-    case 'prompt':  append(`── prompt ──\n${text}\n`, 'prompt'); break;
-    case 'output':  append(text); break;
-    case 'status':  append(`[${text}]\n`, 'note'); break;
-    case 'resync':  append('[output was truncated — re-open to see the full run output]\n', 'resync'); break;
-    case 'end':     append('── end of conversation ──\n', 'end'); break;
+    case 'prompt':  appendSegment(`── prompt ──\n${text}\n`, 'prompt'); break;
+    case 'output':  appendOutput(text); break;
+    case 'status':  appendSegment(`[${text}]\n`, 'note'); break;
+    case 'resync':  appendSegment('[output was truncated — re-open to see the full run output]\n', 'resync'); break;
+    case 'end':     appendSegment('── end of conversation ──\n', 'end'); break;
   }
 }
+
+// Toggle between the raw view (exactly what the agent wrote) and the
+// markdown view; the choice is remembered for the next stream.
+$('#stream-md').addEventListener('click', () => {
+  streamMode = streamMode === 'md' ? 'raw' : 'md';
+  localStorage.setItem('orga-stream-mode', streamMode);
+  updateStreamToggle();
+  rebuildStreamOutput();
+});
 
 $('#stream-close').addEventListener('click', () => {
   if (streamAbort) streamAbort.abort();
@@ -853,7 +1244,7 @@ $('#form').addEventListener('submit', async (e) => {
   // treats "" as "clear" and a missing/null field as "keep current value".
   // The same applies to the workdir.
   const due = $('#due').value || (state.editing ? '' : null);
-  const workdir = $('#workdir').value.trim() || (state.editing ? '' : null);
+  const workdir = formWorkdir() || (state.editing ? '' : null);
   const payload = {
     title: $('#title').value,
     description: $('#description').value,
