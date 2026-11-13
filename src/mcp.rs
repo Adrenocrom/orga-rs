@@ -144,7 +144,7 @@ fn call_tool(api: &Api, params: &Value) -> Result<Value, Value> {
         "list_agents" => tool_list_agents(api),
         "list_workdirs" => tool_list_workdirs(api),
         "add_workdir" => tool_add_workdir(api, &args),
-        "remove_workdir" => tool_remove_workdir(api, &args),
+        //"remove_workdir" => tool_remove_workdir(api, &args),
         "run_task" => tool_run_task(api, &args),
         "get_run" => tool_get_run(api, &args),
         "list_runs" => tool_list_runs(api, &args),
@@ -317,6 +317,7 @@ fn tool_add_workdir(api: &Api, args: &Value) -> ToolResult {
 
 /// Remove a directory from the workdirs config. Removing an entry that is
 /// not in the list is a no-op. Returns the updated list.
+#[allow(dead_code)]
 fn tool_remove_workdir(api: &Api, args: &Value) -> ToolResult {
     let dir = req_workdir(args)?;
     let dirs = api.delete(
